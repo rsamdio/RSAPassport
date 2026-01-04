@@ -1677,60 +1677,115 @@ window.saveContactToPhone = async function(connectionData) {
             return;
         }
         
-        // Generate vCard content
+        // Generate vCard content with more complete information
         let vCard = 'BEGIN:VCARD\n';
         vCard += 'VERSION:3.0\n';
         vCard += `FN:${escapeVCardValue(connection.name)}\n`;
+        vCard += `N:${escapeVCardValue(connection.name)};;;;\n`;
         
         if (connection.email) {
-            vCard += `EMAIL:${escapeVCardValue(connection.email)}\n`;
+            vCard += `EMAIL;TYPE=INTERNET,HOME:${escapeVCardValue(connection.email)}\n`;
         }
         
         if (connection.phone) {
             // Clean phone number (remove spaces, dashes, etc.)
             const cleanPhone = connection.phone.replace(/[\s\-\(\)]/g, '');
-            vCard += `TEL:${cleanPhone}\n`;
+            vCard += `TEL;TYPE=CELL:${cleanPhone}\n`;
+        }
+        
+        // Add additional info if available
+        if (connection.district) {
+            vCard += `ORG:RI District ${escapeVCardValue(connection.district)}\n`;
+        }
+        
+        if (connection.profession) {
+            vCard += `TITLE:${escapeVCardValue(connection.profession)}\n`;
         }
         
         vCard += 'END:VCARD';
         
-        // Create blob
+        // Create blob with proper MIME type
         const blob = new Blob([vCard], { type: 'text/vcard;charset=utf-8' });
-        const file = new File([blob], `${connection.name.replace(/[^a-z0-9]/gi, '_')}.vcf`, { type: 'text/vcard' });
+        const fileName = `${connection.name.replace(/[^a-z0-9]/gi, '_')}.vcf`;
+        const file = new File([blob], fileName, { 
+            type: 'text/vcard',
+            lastModified: Date.now()
+        });
         
-        // Try Web Share API first (mobile)
-        if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+        // Try Web Share API first (mobile - opens contacts app)
+        if (navigator.share) {
             try {
-                await navigator.share({
-                    title: `Contact: ${connection.name}`,
-                    text: `Save ${connection.name} to your contacts`,
-                    files: [file]
-                });
-                showToast('check_circle', `Saved ${connection.name}`, 'success');
-                return;
+                // Check if we can share files
+                if (navigator.canShare && navigator.canShare({ files: [file] })) {
+                    await navigator.share({
+                        title: `Add ${connection.name} to Contacts`,
+                        text: `Save ${connection.name} to your contacts`,
+                        files: [file]
+                    });
+                    showToast('check_circle', `Opening contacts app...`, 'success');
+                    return;
+                } else {
+                    // Fallback: Share text with vCard data URI
+                    const vCardDataUri = `data:text/vcard;charset=utf-8,${encodeURIComponent(vCard)}`;
+                    await navigator.share({
+                        title: `Add ${connection.name} to Contacts`,
+                        text: `Name: ${connection.name}${connection.email ? `\nEmail: ${connection.email}` : ''}${connection.phone ? `\nPhone: ${connection.phone}` : ''}`,
+                        url: vCardDataUri
+                    });
+                    showToast('check_circle', `Opening contacts app...`, 'success');
+                    return;
+                }
             } catch (shareError) {
                 // If share fails or is cancelled, fall back to download
-                if (shareError.name !== 'AbortError') {
-                    console.log('Web Share API failed, falling back to download:', shareError);
-                } else {
+                if (shareError.name === 'AbortError') {
                     // User cancelled, don't show error
                     return;
                 }
+                console.log('Web Share API failed, falling back to download:', shareError);
             }
         }
         
-        // Fallback: Download vCard file
+        // For iOS: Try to open vCard directly using data URI
+        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+        if (isIOS) {
+            try {
+                const vCardDataUri = `data:text/vcard;charset=utf-8,${encodeURIComponent(vCard)}`;
+                const link = document.createElement('a');
+                link.href = vCardDataUri;
+                link.download = fileName;
+                link.style.display = 'none';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                showToast('check_circle', `Opening contacts app...`, 'success');
+                return;
+            } catch (iosError) {
+                console.log('iOS direct open failed, using download:', iosError);
+            }
+        }
+        
+        // Fallback: Download vCard file (will open in contacts app on mobile)
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = url;
-        link.download = `${connection.name.replace(/[^a-z0-9]/gi, '_')}.vcf`;
+        link.download = fileName;
+        link.style.display = 'none';
         document.body.appendChild(link);
         link.click();
-        document.body.removeChild(link);
-        URL.revokeObjectURL(url);
         
-        // Show subtle success message
-        showToast('download', `Downloaded ${connection.name}`, 'success');
+        // Clean up after a short delay
+        setTimeout(() => {
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+        }, 100);
+        
+        // Show success message with instructions for desktop
+        const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        if (isMobile) {
+            showToast('check_circle', `Opening contacts app...`, 'success');
+        } else {
+            showToast('download', `Downloaded ${connection.name}.vcf - Open it to add to contacts`, 'success');
+        }
         
     } catch (error) {
         console.error('Error saving contact:', error);
