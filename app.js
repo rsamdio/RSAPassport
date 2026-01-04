@@ -41,7 +41,8 @@ import {
     getDatabase, 
     ref, 
     get, 
-    set 
+    set,
+    update as rtdbUpdate
 } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js';
 import { deleteDoc } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js';
 
@@ -152,6 +153,19 @@ async function updateRTDBUserData(user) {
             name: userData.fullName || user.displayName || userData.displayName || 'User',
             photo: user.photoURL || null
         });
+        
+        // Update localStorage cache (instant, no network)
+        const score = userData.score || 0;
+        const rank = userData.rank || await calculateRank(score);
+        try {
+            localStorage.setItem(`user_${user.uid}_data`, JSON.stringify({
+                score: score,
+                rank: rank,
+                timestamp: Date.now()
+            }));
+        } catch (localError) {
+            // localStorage might be disabled, ignore
+        }
         
         console.log('RTDB updated successfully for user:', user.uid);
     } catch (error) {
@@ -439,11 +453,30 @@ function getDefaultRank(score) {
     }
 }
 
-// Load user profile
+// Load user profile (using localStorage for current user's data)
 async function loadUserProfile() {
     if (!currentUser) return;
     
     try {
+        // Try to get score/rank from localStorage first (instant, no network)
+        let score = null;
+        let rank = null;
+        
+        try {
+            const cachedData = localStorage.getItem(`user_${currentUser.uid}_data`);
+            if (cachedData) {
+                const parsed = JSON.parse(cachedData);
+                // Check if cache is recent (less than 5 minutes old)
+                if (parsed.timestamp && (Date.now() - parsed.timestamp) < 5 * 60 * 1000) {
+                    score = parsed.score;
+                    rank = parsed.rank;
+                    console.log('Loaded score/rank from localStorage cache');
+                }
+            }
+        } catch (localError) {
+            console.log('localStorage cache not available, will use Firestore');
+        }
+        
         // Get user data using UID as document ID
         const userRef = doc(db, 'users', currentUser.uid);
         const userSnap = await getDoc(userRef);
@@ -451,12 +484,26 @@ async function loadUserProfile() {
         if (userSnap.exists()) {
             const userData = userSnap.data();
             
+            // Use cached score/rank if available, otherwise use Firestore data
+            const finalScore = score !== null ? score : (userData.score || 0);
+            const finalRank = rank || userData.rank || await calculateRank(finalScore);
+            
+            // Update localStorage cache (instant, no network cost)
+            try {
+                localStorage.setItem(`user_${currentUser.uid}_data`, JSON.stringify({
+                    score: finalScore,
+                    rank: finalRank,
+                    timestamp: Date.now()
+                }));
+            } catch (localError) {
+                // localStorage might be disabled, ignore
+            }
+            
             // Update UI
             document.getElementById('user-name').textContent = userData.fullName || userData.displayName || 'User';
             document.getElementById('user-email').textContent = userData.district ? `RI District ${userData.district}` : 'N/A';
-            document.getElementById('user-score').textContent = userData.score || 0;
-            const currentRank = userData.rank || await calculateRank(userData.score || 0);
-            document.getElementById('user-rank').textContent = currentRank;
+            document.getElementById('user-score').textContent = finalScore;
+            document.getElementById('user-rank').textContent = finalRank;
             
             // Set avatar
             const avatarImg = document.getElementById('user-avatar');
@@ -651,32 +698,64 @@ function tryAlternativeQRGeneration(qrToken, canvas) {
     ctx.fillText('Loading...', canvas.width / 2, canvas.height / 2 + 10);
 }
 
-// Load recent connections
+// Load recent connections (using localStorage - we already have scanHistory from user document)
 async function loadRecentConnections() {
     if (!currentUser) return;
     
+    const container = document.getElementById('recent-connections');
+    if (!container) return;
+    
+    container.innerHTML = '';
+    
     try {
-        const userRef = doc(db, 'users', currentUser.uid);
-        const userSnap = await getDoc(userRef);
+        // Try localStorage cache first (instant, no network)
+        let connections = [];
         
-        if (!userSnap.exists()) return;
+        try {
+            const cachedConnections = localStorage.getItem(`user_${currentUser.uid}_recentConnections`);
+            if (cachedConnections) {
+                const parsed = JSON.parse(cachedConnections);
+                // Check if cache is recent (less than 5 minutes old)
+                if (parsed.timestamp && (Date.now() - parsed.timestamp) < 5 * 60 * 1000) {
+                    connections = parsed.connections || [];
+                    console.log('Loaded recent connections from localStorage cache');
+                }
+            }
+        } catch (localError) {
+            // localStorage might be disabled or invalid, continue to Firestore
+        }
         
-        const userData = userSnap.data();
-        const scanHistory = userData.scanHistory || [];
+        // If no cache, get from user document (which we already read in loadUserProfile)
+        // But we'll get it from the userData we already have if available
+        if (connections.length === 0) {
+            const userRef = doc(db, 'users', currentUser.uid);
+            const userSnap = await getDoc(userRef);
+            
+            if (!userSnap.exists()) return;
+            
+            const userData = userSnap.data();
+            const scanHistory = userData.scanHistory || [];
+            
+            // Sort by timestamp (most recent first)
+            connections = [...scanHistory].sort((a, b) => {
+                const timeA = a.scannedAt ? (typeof a.scannedAt === 'string' ? new Date(a.scannedAt).getTime() : a.scannedAt.toMillis()) : 0;
+                const timeB = b.scannedAt ? (typeof b.scannedAt === 'string' ? new Date(b.scannedAt).getTime() : b.scannedAt.toMillis()) : 0;
+                return timeB - timeA;
+            }).slice(0, 3);
+            
+            // Update localStorage cache (instant, no network cost)
+            try {
+                localStorage.setItem(`user_${currentUser.uid}_recentConnections`, JSON.stringify({
+                    connections: connections,
+                    timestamp: Date.now()
+                }));
+            } catch (localError) {
+                // localStorage might be disabled, ignore
+            }
+        }
         
-        // Sort by timestamp (most recent first)
-        const connections = [...scanHistory].sort((a, b) => {
-            const timeA = a.scannedAt ? (typeof a.scannedAt === 'string' ? new Date(a.scannedAt).getTime() : a.scannedAt.toMillis()) : 0;
-            const timeB = b.scannedAt ? (typeof b.scannedAt === 'string' ? new Date(b.scannedAt).getTime() : b.scannedAt.toMillis()) : 0;
-            return timeB - timeA;
-        });
-        
-        const container = document.getElementById('recent-connections');
-        if (!container) return;
-        
-        container.innerHTML = '';
-        
-        connections.slice(0, 3).forEach(conn => {
+        // Display connections
+        connections.forEach(conn => {
             const img = document.createElement('img');
             img.src = conn.photo || '';
             img.alt = conn.name || 'User';
@@ -692,15 +771,87 @@ async function loadRecentConnections() {
             container.appendChild(img);
         });
         
-        if (connections.length > 3) {
-            const more = document.createElement('div');
-            more.className = 'h-12 w-12 rounded-full ring-4 ring-background-dark bg-surface-dark flex items-center justify-center border border-white/10 text-xs font-bold text-slate-400';
-            more.textContent = `+${connections.length - 3}`;
-            container.appendChild(more);
+        // Show "+X more" if there are more connections
+        if (connections.length === 3) {
+            try {
+                const userRef = doc(db, 'users', currentUser.uid);
+                const userSnap = await getDoc(userRef);
+                if (userSnap.exists()) {
+                    const userData = userSnap.data();
+                    const totalConnections = (userData.scanHistory || []).length;
+                    if (totalConnections > 3) {
+                        const more = document.createElement('div');
+                        more.className = 'h-12 w-12 rounded-full ring-4 ring-background-dark bg-surface-dark flex items-center justify-center border border-white/10 text-xs font-bold text-slate-400';
+                        more.textContent = `+${totalConnections - 3}`;
+                        container.appendChild(more);
+                    }
+                }
+            } catch (err) {
+                // Ignore error, just don't show "+X more"
+            }
         }
     } catch (error) {
         console.error('Error loading recent connections:', error);
         // Don't show alert - this is a non-critical feature
+    }
+}
+
+// Note: Removed RTDB cache functions for current user's data
+// Using localStorage instead since we already read the full user document from Firestore
+
+// Get user's leaderboard rank (position in leaderboard: 1st, 2nd, 3rd, etc.)
+async function getUserLeaderboardRank(uid) {
+    try {
+        // Try localStorage first (instant, no network)
+        const cached = localStorage.getItem(`leaderboardRank_${uid}`);
+        if (cached) {
+            const parsed = JSON.parse(cached);
+            // Cache valid for 5 minutes
+            if (parsed.timestamp && (Date.now() - parsed.timestamp) < 5 * 60 * 1000) {
+                return parsed.rank;
+            }
+        }
+
+        // Try RTDB cache (cheap, 1 read)
+        const rankRef = ref(rtdb, `ranks/${uid}`);
+        const rankSnap = await get(rankRef);
+        
+        if (rankSnap.exists()) {
+            const rankData = rankSnap.val();
+            const rank = rankData.leaderboardRank;
+            
+            // Cache in localStorage
+            try {
+                localStorage.setItem(`leaderboardRank_${uid}`, JSON.stringify({
+                    rank: rank,
+                    timestamp: Date.now()
+                }));
+            } catch (localError) {
+                // localStorage might be disabled, ignore
+            }
+            
+            return rank;
+        }
+
+        // Fallback: Calculate from Firestore (expensive - reads all users)
+        // This should rarely happen if Cloud Functions are working
+        console.warn('RTDB rank cache not found, falling back to Firestore calculation');
+        const allUsersRef = collection(db, 'users');
+        const allUsersQuery = query(allUsersRef, orderBy('score', 'desc'));
+        const allUsersSnap = await getDocs(allUsersQuery);
+        
+        let rank = 1;
+        for (const doc of allUsersSnap.docs) {
+            if (doc.id === uid) {
+                return rank;
+            }
+            rank++;
+        }
+        
+        return null; // User not found
+    } catch (error) {
+        console.error('Error getting user leaderboard rank:', error);
+        return null;
     }
 }
 
@@ -1112,6 +1263,9 @@ async function processScan(qrToken) {
             });
         });
         
+        // Update localStorage cache after successful scan (instant, no network)
+        updateLocalStorageAfterScan(scannerUid, expectedNewScore, finalRank, scanEntry);
+        
         // Show subtle success notification
         showToast('check_circle', 'You earned 10 points!', 'success');
         
@@ -1165,6 +1319,75 @@ async function processScan(qrToken) {
                 ensureScannerActive();
             }
         }, 500);
+    }
+}
+
+// Update localStorage cache after a successful scan (instant, no network)
+function updateLocalStorageAfterScan(uid, newScore, newRank, scanEntry) {
+    try {
+        // Update score/rank cache
+        localStorage.setItem(`user_${uid}_data`, JSON.stringify({
+            score: newScore,
+            rank: newRank,
+            timestamp: Date.now()
+        }));
+        
+        // Update recent connections cache
+        try {
+            const cachedConnections = localStorage.getItem(`user_${uid}_recentConnections`);
+            let connections = [];
+            
+            if (cachedConnections) {
+                const parsed = JSON.parse(cachedConnections);
+                connections = parsed.connections || [];
+            }
+            
+            // Add new connection at the beginning
+            connections.unshift({
+                uid: scanEntry.uid,
+                name: scanEntry.name,
+                photo: scanEntry.photo || null
+            });
+            
+            // Keep only last 3
+            connections = connections.slice(0, 3);
+            
+            localStorage.setItem(`user_${uid}_recentConnections`, JSON.stringify({
+                connections: connections,
+                timestamp: Date.now()
+            }));
+        } catch (connError) {
+            // If we can't update connections cache, that's okay
+            console.warn('Could not update connections cache:', connError);
+        }
+        
+        console.log('Updated localStorage cache after scan');
+    } catch (error) {
+        console.warn('Error updating localStorage cache after scan:', error);
+        // Non-critical, don't throw
+    }
+}
+
+// Refresh leaderboard cache from Firestore
+async function refreshLeaderboardCache() {
+    try {
+        const usersRef = collection(db, 'users');
+        const q = query(usersRef, orderBy('score', 'desc'), limit(10));
+        const querySnapshot = await getDocs(q);
+        
+        const participants = [];
+        querySnapshot.forEach((doc) => {
+            const data = doc.data();
+            participants.push({
+                uid: doc.id,
+                ...data
+            });
+        });
+        
+        await updateLeaderboardCache(participants);
+    } catch (error) {
+        console.warn('Error refreshing leaderboard cache:', error);
+        // Non-critical
     }
 }
 
@@ -1339,55 +1562,121 @@ window.addEventListener('beforeunload', async () => {
     }
 });
 
-// Load leaderboard
+// Load leaderboard (optimized with RTDB cache)
 async function loadLeaderboard() {
-    const usersRef = collection(db, 'users');
-    const q = query(usersRef, orderBy('score', 'desc'), limit(10));
+    let participants = [];
     
     try {
-        const querySnapshot = await getDocs(q);
-        const participants = [];
+        // Try RTDB cache first (cost-effective)
+        const leaderboardRef = ref(rtdb, 'leaderboard/top10');
+        const leaderboardSnap = await get(leaderboardRef);
         
-        querySnapshot.forEach((doc) => {
-            const data = doc.data();
-            participants.push({
-                uid: doc.id,
-                ...data
-            });
+        if (leaderboardSnap.exists()) {
+            const leaderboardData = leaderboardSnap.val();
+            // Convert object to array, maintaining order
+            participants = Object.keys(leaderboardData)
+                .sort((a, b) => parseInt(a) - parseInt(b))
+                .map(key => leaderboardData[key])
+                .filter(p => p !== null); // Filter out null entries
+            
+            console.log('Loaded leaderboard from RTDB cache');
+        } else {
+            // Fallback to Firestore if RTDB cache doesn't exist
+            console.log('RTDB cache not found, falling back to Firestore');
+            throw new Error('RTDB_CACHE_MISS');
+        }
+    } catch (error) {
+        // Fallback to Firestore query
+        if (error.message === 'RTDB_CACHE_MISS' || error.code === 'PERMISSION_DENIED') {
+            try {
+                console.log('Loading leaderboard from Firestore (fallback)');
+                const usersRef = collection(db, 'users');
+                const q = query(usersRef, orderBy('score', 'desc'), limit(10));
+                const querySnapshot = await getDocs(q);
+                
+                participants = [];
+                querySnapshot.forEach((doc) => {
+                    const data = doc.data();
+                    participants.push({
+                        uid: doc.id,
+                        ...data
+                    });
+                });
+                
+                // Update RTDB cache for next time (non-blocking)
+                updateLeaderboardCache(participants).catch(err => {
+                    console.warn('Failed to update RTDB cache:', err);
+                });
+            } catch (firestoreError) {
+                console.error('Error loading leaderboard from Firestore:', firestoreError);
+                return;
+            }
+        } else {
+            console.error('Error loading leaderboard:', error);
+            return;
+        }
+    }
+    
+    // Display top 3
+    const topThreeContainer = document.getElementById('top-three-container');
+    topThreeContainer.innerHTML = '';
+    
+    if (participants.length >= 3) {
+        // Second place
+        createTopThreeCard(participants[1], 2, topThreeContainer);
+        // First place
+        createTopThreeCard(participants[0], 1, topThreeContainer);
+        // Third place
+        createTopThreeCard(participants[2], 3, topThreeContainer);
+    } else {
+        participants.forEach((participant, index) => {
+            createTopThreeCard(participant, index + 1, topThreeContainer);
+        });
+    }
+    
+    // Display rest of leaderboard
+    const leaderboardList = document.getElementById('leaderboard-list');
+    leaderboardList.innerHTML = '';
+    
+    participants.slice(3).forEach((participant, index) => {
+        const rank = index + 4;
+        const item = createLeaderboardItem(participant, rank);
+        leaderboardList.appendChild(item);
+    });
+    
+    // Display current user footer
+    await loadCurrentUserFooter(participants);
+}
+
+// Update leaderboard cache in RTDB (called after score changes)
+async function updateLeaderboardCache(participants) {
+    try {
+        const leaderboardRef = ref(rtdb, 'leaderboard/top10');
+        const cacheData = {};
+        
+        // Store top 10 in indexed format
+        participants.slice(0, 10).forEach((participant, index) => {
+            cacheData[index] = {
+                uid: participant.uid,
+                name: participant.fullName || participant.displayName || participant.name || 'User',
+                score: participant.score || 0,
+                rank: participant.rank || 'Rookie',
+                photo: participant.photoURL || null,
+                email: participant.email || null,
+                district: participant.district || null
+            };
         });
         
-        // Display top 3
-        const topThreeContainer = document.getElementById('top-three-container');
-        topThreeContainer.innerHTML = '';
-        
-        if (participants.length >= 3) {
-            // Second place
-            createTopThreeCard(participants[1], 2, topThreeContainer);
-            // First place
-            createTopThreeCard(participants[0], 1, topThreeContainer);
-            // Third place
-            createTopThreeCard(participants[2], 3, topThreeContainer);
-        } else {
-            participants.forEach((participant, index) => {
-                createTopThreeCard(participant, index + 1, topThreeContainer);
-            });
+        // Fill remaining slots with null if less than 10
+        for (let i = participants.length; i < 10; i++) {
+            cacheData[i] = null;
         }
         
-        // Display rest of leaderboard
-        const leaderboardList = document.getElementById('leaderboard-list');
-        leaderboardList.innerHTML = '';
-        
-        participants.slice(3).forEach((participant, index) => {
-            const rank = index + 4;
-            const item = createLeaderboardItem(participant, rank);
-            leaderboardList.appendChild(item);
-        });
-        
-        // Display current user footer
-        await loadCurrentUserFooter(participants);
-        
+        await set(leaderboardRef, cacheData);
+        console.log('Updated leaderboard cache in RTDB');
     } catch (error) {
-        console.error('Error loading leaderboard:', error);
+        console.warn('Failed to update leaderboard cache:', error);
+        // Non-critical, don't throw
     }
 }
 
@@ -1488,19 +1777,8 @@ async function loadCurrentUserFooter(leaderboardParticipants) {
         if (userIndex !== -1) {
             userRank = userIndex + 1;
         } else {
-            // User is not in top 10, need to calculate rank
-            const allUsersRef = collection(db, 'users');
-            const allUsersQuery = query(allUsersRef, orderBy('score', 'desc'));
-            const allUsersSnap = await getDocs(allUsersQuery);
-            
-            let rank = 1;
-            for (const doc of allUsersSnap.docs) {
-                if (doc.id === currentUser.uid) {
-                    userRank = rank;
-                    break;
-                }
-                rank++;
-            }
+            // User is not in top 10, get rank from RTDB cache (much cheaper than reading all users)
+            userRank = await getUserLeaderboardRank(currentUser.uid);
         }
         
         const initials = (userData.fullName || userData.displayName || 'U').split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
