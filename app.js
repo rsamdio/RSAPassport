@@ -1688,6 +1688,7 @@ function createTopThreeCard(participant, rank, container) {
     
     const initials = (participant.fullName || participant.displayName || participant.name || 'U').split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
     const photoURL = participant.photo || participant.photoURL || null;
+    const district = participant.district ? `RI District ${participant.district}` : null;
     
     card.className = `flex flex-col items-center ${widthClass} ${marginClass} group cursor-pointer`;
     
@@ -1711,6 +1712,7 @@ function createTopThreeCard(participant, rank, container) {
                 </div>
             </div>
             <p class="text-base font-extrabold text-center leading-tight mb-0.5 truncate w-full px-1 text-white">${participant.fullName || participant.displayName || participant.name || 'User'}</p>
+            ${district ? `<p class="text-[10px] text-white/70 text-center mb-0.5 truncate w-full px-1">${district}</p>` : ''}
             <p class="text-xs text-primary font-black bg-primary/20 px-2 py-0.5 rounded-full text-white">${participant.score || 0} pts</p>
         `;
     } else {
@@ -1731,6 +1733,7 @@ function createTopThreeCard(participant, rank, container) {
                 </div>
             </div>
             <p class="text-sm font-bold text-center leading-tight mb-0.5 truncate w-full px-1 text-white">${participant.fullName || participant.displayName || participant.name || 'User'}</p>
+            ${district ? `<p class="text-[9px] text-white/60 text-center mb-0.5 truncate w-full px-1">${district}</p>` : ''}
             <p class="text-[10px] text-white/80 font-bold bg-white/10 px-2 py-0.5 rounded-full">${participant.score || 0} pts</p>
         `;
     }
@@ -1803,6 +1806,7 @@ async function loadCurrentUserFooter(leaderboardParticipants) {
         }
         
         const initials = (userData.fullName || userData.displayName || 'U').split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
+        const photoURL = userData.photoURL || (currentUser && currentUser.photoURL) || null;
         const footer = document.getElementById('current-user-footer');
         if (!footer) return;
         
@@ -1815,8 +1819,14 @@ async function loadCurrentUserFooter(leaderboardParticipants) {
                     <span class="text-xl font-black text-white leading-none">${userRank || '--'}</span>
                 </div>
                 <div class="relative shrink-0">
-                    <div class="w-12 h-12 rounded-full border-2 border-primary bg-gradient-to-br from-slate-700 to-slate-900 flex items-center justify-center text-white text-lg font-bold shadow-[0_0_15px_rgba(13,185,242,0.3)]">
-                        <span class="text-primary">${initials}</span>
+                    <div class="w-12 h-12 rounded-full border-2 border-primary bg-gradient-to-br from-slate-700 to-slate-900 flex items-center justify-center text-white text-lg font-bold shadow-[0_0_15px_rgba(13,185,242,0.3)] overflow-hidden">
+                        ${photoURL ? 
+                            `<img src="${photoURL}" alt="${userData.fullName || userData.displayName || 'User'}" class="w-full h-full object-cover rounded-full" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+                             <div class="absolute inset-0 bg-gradient-to-br from-slate-700 to-slate-900 flex items-center justify-center text-white text-lg font-bold" style="display: none;">
+                                 <span class="text-primary">${initials}</span>
+                             </div>` :
+                            `<span class="text-primary">${initials}</span>`
+                        }
                     </div>
                     <div class="absolute -bottom-1 -right-1 bg-primary text-white text-[8px] font-bold px-1.5 py-0.5 rounded-full border border-slate-900">YOU</div>
                 </div>
