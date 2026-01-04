@@ -1,10 +1,3 @@
-# Firestore Security Rules (FINAL WORKING VERSION)
-
-**CRITICAL**: Copy and paste these EXACT rules into Firebase Console → Firestore Database → Rules
-
-This version uses the simplest possible rules that will work reliably.
-
-```javascript
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -72,53 +65,4 @@ service cloud.firestore {
     }
   }
 }
-```
-
-## Key Simplifications
-
-1. **No connections collection**: Removed entirely - duplicate prevention now uses `scanHistory` array in user documents
-   - Simpler architecture
-   - Single source of truth
-   - Reduced costs (~25% fewer operations per 
-
-2. **pendingUsers read rule**: Changed from complex email matching to simple `request.auth != null`
-   - The code validates email match before using the data
-   - This avoids Firestore rule engine issues with string normalization
-
-3. **pendingUsers delete rule**: Changed from complex email matching to simple `request.auth != null`
-   - The code validates email match before deleting
-   - This avoids Firestore rule engine issues
-
-4. **users create rule**: Simplified to just `isOwnUser(uid)`
-   - Removed the `exists(pendingUsers)` check - the code handles this logic
-   - This makes the rule simpler and more reliable
-
-## Why This Works
-
-- **Security**: The code validates email matches before using/deleting pendingUsers data
-- **Reliability**: Simpler rules = fewer edge cases = more reliable
-- **Performance**: Simpler rules = faster evaluation
-
-## Deployment Steps
-
-1. Go to **Firebase Console** → **Firestore Database** → **Rules**
-2. **Delete all existing rules**
-3. **Copy the entire rules block above** (from `rules_version = '2';` to the closing `}`)
-4. **Paste** into the rules editor
-5. Click **Publish**
-6. Wait 10-20 seconds for rules to propagate
-7. **Clear browser cache** and try logging in again
-
-## Verification
-
-After deploying, check the browser console. You should see:
-- `Checking pendingUsers for email: rsamdio2627@gmail.com`
-- `Pending user exists: true` (or query returns results)
-- `Successfully migrated user from pendingUsers to users collection`
-
-If you still see permission errors:
-1. Check that rules were actually published (refresh Firebase Console)
-2. Clear browser cache completely
-3. Try in incognito mode
-4. Check that the user email in `pendingUsers` matches exactly (case-insensitive)
 

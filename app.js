@@ -812,11 +812,35 @@ async function getUserLeaderboardRank(uid) {
             }
         }
 
-        // Try RTDB cache (cheap, 1 read)
+        // Try RTDB cache (cheap, 1 read) with retry logic
         const rankRef = ref(rtdb, `ranks/${uid}`);
-        const rankSnap = await get(rankRef);
+        let rankSnap;
+        let retryCount = 0;
+        const maxRetries = 3;
         
-        if (rankSnap.exists()) {
+        // Retry logic: attempt up to 3 times with exponential backoff
+        while (retryCount < maxRetries) {
+            try {
+                rankSnap = await get(rankRef);
+                if (rankSnap.exists()) {
+                    break; // Success, exit retry loop
+                }
+                
+                // If cache is empty, wait and retry (might be updating)
+                if (retryCount < maxRetries - 1) {
+                    await new Promise(resolve => setTimeout(resolve, 100 * (retryCount + 1)));
+                }
+                retryCount++;
+            } catch (error) {
+                if (retryCount === maxRetries - 1) {
+                    throw error; // Last attempt failed, throw error
+                }
+                await new Promise(resolve => setTimeout(resolve, 100 * (retryCount + 1)));
+                retryCount++;
+            }
+        }
+        
+        if (rankSnap && rankSnap.exists()) {
             const rankData = rankSnap.val();
             const rank = rankData.leaderboardRank;
             
@@ -1170,47 +1194,30 @@ async function processScan(qrToken) {
         const targetData = qrTokenSnap.val();
         const targetUid = targetData.uid;
         
-        // Fetch full user data from Firestore to get email, phone, district, profession
-        const targetUserRef = doc(db, 'users', targetUid);
-        const targetUserSnap = await getDoc(targetUserRef);
-        const targetUserData = targetUserSnap.exists() ? targetUserSnap.data() : {};
-        
         // Step 2: Check if scanning self
         if (targetUid === scannerUid) {
             throw new Error("You can't scan your own QR code!");
         }
         
-        // Step 3: Get current user data to calculate expected new score and rank BEFORE transaction
-        const scannerUserRef = doc(db, 'users', scannerUid);
-        const currentUserDoc = await getDoc(scannerUserRef);
-        
-        if (!currentUserDoc.exists()) {
-            throw new Error("Current user document does not exist!");
-        }
-        
-        const currentUserData = currentUserDoc.data();
-        const currentScore = currentUserData.score || 0;
-        const expectedNewScore = currentScore + 10;
-        
-        // Pre-calculate rank (using cache if available, otherwise will use default)
-        const newRank = await calculateRank(expectedNewScore);
-        
         // Prepare scan entry data (before transaction to ensure consistency)
+        // Use RTDB cache data which now includes all needed fields
         const scanEntry = {
             uid: targetData.uid,
-            name: targetUserData.fullName || targetData.name || 'Unknown',
-            photo: targetUserData.photoURL || targetData.photo || null,
-            email: targetUserData.email || null,
-            phone: targetUserData.phone || null,
-            district: targetUserData.district || null,
-            profession: targetUserData.profession || null,
+            name: targetData.name || 'Unknown',
+            photo: targetData.photo || null,
+            email: targetData.email || null,
+            phone: targetData.phone || null,
+            district: targetData.district || null,
+            profession: targetData.profession || null,
             scannedAt: new Date().toISOString() // Use ISO string for consistency
         };
         
-        // Step 4: Transaction to check scanHistory, update score, and add to scanHistory atomically
+        // Step 3: Transaction to check scanHistory, update score, and add to scanHistory atomically
         // This ensures NO duplicates can occur even with concurrent scans
+        const scannerUserRef = doc(db, 'users', scannerUid);
+        
         await runTransaction(db, async (transaction) => {
-            // Re-read user document within transaction to get latest state
+            // Read user document within transaction to get latest state
             const scannerUserDoc = await transaction.get(scannerUserRef);
             
             if (!scannerUserDoc.exists()) {
@@ -1219,6 +1226,8 @@ async function processScan(qrToken) {
             
             const userData = scannerUserDoc.data();
             const scanHistory = userData.scanHistory || [];
+            const currentScore = userData.score || 0;
+            const newScore = currentScore + 10;
             
             // CRITICAL: Check if already scanned by looking in scanHistory array
             // This check MUST be inside the transaction to prevent race conditions
@@ -1240,19 +1249,9 @@ async function processScan(qrToken) {
                 throw new Error('ALREADY_SCANNED');
             }
             
-            // Verify score hasn't changed (defensive check)
-            const transactionScore = userData.score || 0;
-            
-            // Calculate rank synchronously using cache (no async Firestore reads in transaction)
-            let finalRank = newRank;
-            if (transactionScore !== currentScore) {
-                // Score changed, use cached ranks or default
-                if (ranksCache) {
-                    finalRank = findRankForScore(transactionScore + 10, ranksCache);
-                } else {
-                    finalRank = getDefaultRank(transactionScore + 10);
-                }
-            }
+            // Calculate rank (using cache if available, otherwise will use default)
+            // Note: calculateRank is synchronous and uses cached rank data
+            const finalRank = await calculateRank(newScore);
             
             // Update user: increment score, add to scanHistory, and update rank ALL ATOMICALLY
             // This is the critical fix - scanHistory update is now inside the transaction
@@ -1263,8 +1262,14 @@ async function processScan(qrToken) {
             });
         });
         
+        // Get the updated score for localStorage update
+        const updatedUserDoc = await getDoc(scannerUserRef);
+        const updatedUserData = updatedUserDoc.exists() ? updatedUserDoc.data() : {};
+        const updatedScore = updatedUserData.score || 0;
+        const updatedRank = updatedUserData.rank || 'Rookie';
+        
         // Update localStorage cache after successful scan (instant, no network)
-        updateLocalStorageAfterScan(scannerUid, expectedNewScore, finalRank, scanEntry);
+        updateLocalStorageAfterScan(scannerUid, updatedScore, updatedRank, scanEntry);
         
         // Show subtle success notification
         showToast('check_circle', 'You earned 10 points!', 'success');
@@ -1369,27 +1374,9 @@ function updateLocalStorageAfterScan(uid, newScore, newRank, scanEntry) {
 }
 
 // Refresh leaderboard cache from Firestore
-async function refreshLeaderboardCache() {
-    try {
-        const usersRef = collection(db, 'users');
-        const q = query(usersRef, orderBy('score', 'desc'), limit(10));
-        const querySnapshot = await getDocs(q);
-        
-        const participants = [];
-        querySnapshot.forEach((doc) => {
-            const data = doc.data();
-            participants.push({
-                uid: doc.id,
-                ...data
-            });
-        });
-        
-        await updateLeaderboardCache(participants);
-    } catch (error) {
-        console.warn('Error refreshing leaderboard cache:', error);
-        // Non-critical
-    }
-}
+// Note: refreshLeaderboardCache() function removed
+// Cloud Functions now handle all leaderboard cache updates automatically
+// This ensures better security (no client write permissions) and consistency
 
 // Subtle toast notification system
 function showToast(iconName, message, type = 'info') {
@@ -1567,11 +1554,35 @@ async function loadLeaderboard() {
     let participants = [];
     
     try {
-        // Try RTDB cache first (cost-effective)
+        // Try RTDB cache first (cost-effective) with retry logic
         const leaderboardRef = ref(rtdb, 'leaderboard/top10');
-        const leaderboardSnap = await get(leaderboardRef);
+        let leaderboardSnap;
+        let retryCount = 0;
+        const maxRetries = 3;
         
-        if (leaderboardSnap.exists()) {
+        // Retry logic: attempt up to 3 times with exponential backoff
+        while (retryCount < maxRetries) {
+            try {
+                leaderboardSnap = await get(leaderboardRef);
+                if (leaderboardSnap.exists()) {
+                    break; // Success, exit retry loop
+                }
+                
+                // If cache is empty, wait and retry (might be updating)
+                if (retryCount < maxRetries - 1) {
+                    await new Promise(resolve => setTimeout(resolve, 100 * (retryCount + 1)));
+                }
+                retryCount++;
+            } catch (error) {
+                if (retryCount === maxRetries - 1) {
+                    throw error; // Last attempt failed, throw error
+                }
+                await new Promise(resolve => setTimeout(resolve, 100 * (retryCount + 1)));
+                retryCount++;
+            }
+        }
+        
+        if (leaderboardSnap && leaderboardSnap.exists()) {
             const leaderboardData = leaderboardSnap.val();
             // Convert object to array, maintaining order
             participants = Object.keys(leaderboardData)
@@ -1581,8 +1592,8 @@ async function loadLeaderboard() {
             
             console.log('Loaded leaderboard from RTDB cache');
         } else {
-            // Fallback to Firestore if RTDB cache doesn't exist
-            console.log('RTDB cache not found, falling back to Firestore');
+            // Fallback to Firestore if RTDB cache doesn't exist after retries
+            console.log('RTDB cache not found after retries, falling back to Firestore');
             throw new Error('RTDB_CACHE_MISS');
         }
     } catch (error) {
@@ -1603,10 +1614,8 @@ async function loadLeaderboard() {
                     });
                 });
                 
-                // Update RTDB cache for next time (non-blocking)
-                updateLeaderboardCache(participants).catch(err => {
-                    console.warn('Failed to update RTDB cache:', err);
-                });
+                // Note: RTDB cache updates are handled automatically by Cloud Functions
+                // No need to update cache from client side
             } catch (firestoreError) {
                 console.error('Error loading leaderboard from Firestore:', firestoreError);
                 return;
@@ -1649,36 +1658,9 @@ async function loadLeaderboard() {
 }
 
 // Update leaderboard cache in RTDB (called after score changes)
-async function updateLeaderboardCache(participants) {
-    try {
-        const leaderboardRef = ref(rtdb, 'leaderboard/top10');
-        const cacheData = {};
-        
-        // Store top 10 in indexed format
-        participants.slice(0, 10).forEach((participant, index) => {
-            cacheData[index] = {
-                uid: participant.uid,
-                name: participant.fullName || participant.displayName || participant.name || 'User',
-                score: participant.score || 0,
-                rank: participant.rank || 'Rookie',
-                photo: participant.photo || participant.photoURL || null,
-                email: participant.email || null,
-                district: participant.district || null
-            };
-        });
-        
-        // Fill remaining slots with null if less than 10
-        for (let i = participants.length; i < 10; i++) {
-            cacheData[i] = null;
-        }
-        
-        await set(leaderboardRef, cacheData);
-        console.log('Updated leaderboard cache in RTDB');
-    } catch (error) {
-        console.warn('Failed to update leaderboard cache:', error);
-        // Non-critical, don't throw
-    }
-}
+// Note: updateLeaderboardCache() function removed
+// Cloud Functions now handle all leaderboard cache updates automatically
+// This ensures better security (no client write permissions) and consistency
 
 function createTopThreeCard(participant, rank, container) {
     const card = document.createElement('div');

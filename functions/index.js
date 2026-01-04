@@ -38,14 +38,22 @@ exports.onUserScoreUpdate = onDocumentUpdated(
 
       const updates = {};
 
-      // Update QR code data if name or photo changed
+      // Update QR code data if name, photo, or contact info changed
       if (before.fullName !== after.fullName ||
-          before.photoURL !== after.photoURL) {
+          before.photoURL !== after.photoURL ||
+          before.email !== after.email ||
+          before.phone !== after.phone ||
+          before.district !== after.district ||
+          before.profession !== after.profession) {
         if (after.qrToken) {
           updates[`qrcodes/${after.qrToken}`] = {
             uid: uid,
             name: after.fullName || after.displayName || "User",
             photo: after.photoURL || null,
+            email: after.email || null,
+            phone: after.phone || null,
+            district: after.district || null,
+            profession: after.profession || null,
           };
         }
       }
@@ -89,6 +97,10 @@ exports.onUserCreate = onDocumentCreated(
           uid: uid,
           name: userData.fullName || userData.displayName || "User",
           photo: userData.photoURL || null,
+          email: userData.email || null,
+          phone: userData.phone || null,
+          district: userData.district || null,
+          profession: userData.profession || null,
         };
       }
 
