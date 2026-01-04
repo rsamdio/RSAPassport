@@ -1661,7 +1661,7 @@ async function updateLeaderboardCache(participants) {
                 name: participant.fullName || participant.displayName || participant.name || 'User',
                 score: participant.score || 0,
                 rank: participant.rank || 'Rookie',
-                photo: participant.photoURL || null,
+                photo: participant.photo || participant.photoURL || null,
                 email: participant.email || null,
                 district: participant.district || null
             };
@@ -1687,6 +1687,7 @@ function createTopThreeCard(participant, rank, container) {
     const marginClass = isFirst ? '-mt-6 animate-float' : 'mb-4';
     
     const initials = (participant.fullName || participant.displayName || participant.name || 'U').split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
+    const photoURL = participant.photo || participant.photoURL || null;
     
     card.className = `flex flex-col items-center ${widthClass} ${marginClass} group cursor-pointer`;
     
@@ -1695,8 +1696,15 @@ function createTopThreeCard(participant, rank, container) {
             <div class="relative mb-3">
                 <span class="absolute -top-9 left-1/2 -translate-x-1/2 text-4xl drop-shadow-xl text-yellow-400 material-symbols-outlined z-20" style="font-variation-settings: 'FILL' 1;">crown</span>
                 <div class="w-24 h-24 rounded-full border-4 border-primary bg-gradient-to-br from-yellow-300 via-orange-400 to-red-500 shadow-[0_0_30px_rgba(13,185,242,0.3)] flex items-center justify-center text-white text-3xl font-black relative overflow-hidden">
-                    <div class="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] opacity-20"></div>
-                    <span class="relative z-10">${initials}</span>
+                    ${photoURL ? 
+                        `<img src="${photoURL}" alt="${participant.fullName || participant.displayName || participant.name || 'User'}" class="w-full h-full object-cover rounded-full" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+                         <div class="absolute inset-0 bg-gradient-to-br from-yellow-300 via-orange-400 to-red-500 flex items-center justify-center text-white text-3xl font-black" style="display: none;">
+                             <div class="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] opacity-20"></div>
+                             <span class="relative z-10">${initials}</span>
+                         </div>` :
+                        `<div class="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] opacity-20"></div>
+                         <span class="relative z-10">${initials}</span>`
+                    }
                 </div>
                 <div class="absolute -bottom-3 left-1/2 -translate-x-1/2 bg-gradient-to-r from-primary to-blue-600 text-white text-xs font-black px-3 py-0.5 rounded-full shadow-lg shadow-primary/30 border border-white/20">
                     1st Place
@@ -1711,7 +1719,13 @@ function createTopThreeCard(participant, rank, container) {
         const rankColorLight = rank === 2 ? '#60a5fa' : '#fb923c'; // blue-400 or orange-400
         card.innerHTML = `
             <div class="relative mb-2 transition-transform group-hover:-translate-y-1">
-                <div class="w-[4.5rem] h-[4.5rem] rounded-full border-4 border-white dark:border-[#1e293b] shadow-lg flex items-center justify-center text-white text-xl font-black" style="background: linear-gradient(to bottom right, ${rankColorLight}, ${rankColor});">${initials}</div>
+                <div class="w-[4.5rem] h-[4.5rem] rounded-full border-4 border-white dark:border-[#1e293b] shadow-lg flex items-center justify-center text-white text-xl font-black overflow-hidden" style="background: linear-gradient(to bottom right, ${rankColorLight}, ${rankColor});">
+                    ${photoURL ? 
+                        `<img src="${photoURL}" alt="${participant.fullName || participant.displayName || participant.name || 'User'}" class="w-full h-full object-cover rounded-full" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+                         <div class="absolute inset-0 flex items-center justify-center text-white text-xl font-black" style="background: linear-gradient(to bottom right, ${rankColorLight}, ${rankColor}); display: none;">${initials}</div>` :
+                        initials
+                    }
+                </div>
                 <div class="absolute -bottom-2 left-1/2 -translate-x-1/2 bg-white dark:bg-[#1e293b] text-slate-700 dark:text-white text-[10px] font-bold px-2 py-0.5 rounded-full border border-gray-200 dark:border-gray-700 shadow-md flex items-center gap-1">
                     <span style="color: ${rankColor};">#</span>${rank}
                 </div>
@@ -1729,7 +1743,10 @@ function createLeaderboardItem(participant, rank) {
     item.className = 'group flex items-center gap-3 bg-[#1a2c32] hover:bg-[#1e3540] border border-white/10 p-3 rounded-2xl transition-all active:scale-[0.99]';
     
     const initials = (participant.fullName || participant.displayName || participant.name || 'U').split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
-    // Color gradients for avatars
+    const photoURL = participant.photo || participant.photoURL || null;
+    const district = participant.district ? `RI District ${participant.district}` : 'N/A';
+    
+    // Color gradients for avatars (fallback when no photo)
     const colorGradients = [
         { from: '#a855f7', to: '#9333ea' }, // fuchsia to purple
         { from: '#8b5cf6', to: '#7c3aed' }, // violet to indigo
@@ -1745,13 +1762,17 @@ function createLeaderboardItem(participant, rank) {
             <span class="text-sm font-bold text-white/70 group-hover:text-white">#${rank}</span>
         </div>
         <div class="relative shrink-0">
-            <div class="w-10 h-10 rounded-full flex items-center justify-center text-white text-sm font-bold shadow-sm" style="background: linear-gradient(to bottom right, ${gradient.from}, ${gradient.to});">${initials}</div>
+            ${photoURL ? 
+                `<img src="${photoURL}" alt="${participant.fullName || participant.displayName || participant.name || 'User'}" class="w-10 h-10 rounded-full object-cover border-2 border-white/20 shadow-sm" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+                 <div class="w-10 h-10 rounded-full flex items-center justify-center text-white text-sm font-bold shadow-sm" style="background: linear-gradient(to bottom right, ${gradient.from}, ${gradient.to}); display: none;">${initials}</div>` :
+                `<div class="w-10 h-10 rounded-full flex items-center justify-center text-white text-sm font-bold shadow-sm" style="background: linear-gradient(to bottom right, ${gradient.from}, ${gradient.to});">${initials}</div>`
+            }
         </div>
         <div class="flex flex-col flex-1 items-start min-w-0">
             <div class="flex items-center gap-1.5 w-full">
                 <p class="text-white text-sm font-bold truncate">${participant.fullName || participant.displayName || participant.name || 'User'}</p>
             </div>
-            <p class="text-white/60 text-[10px] truncate">${participant.email || ''}</p>
+            <p class="text-white/60 text-[10px] truncate">${district}</p>
         </div>
         <div class="shrink-0 text-right bg-white/10 px-2 py-1 rounded-lg">
             <p class="text-white font-bold text-sm">${participant.score || 0}</p>
