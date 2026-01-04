@@ -18,6 +18,135 @@ const db = admin.firestore();
 const rtdb = admin.database();
 
 /**
+ * Helper function to normalize email for cache key
+ * @param {string} email - Email to normalize
+ * @return {string|null} Normalized email or null
+ */
+function normalizeEmail(email) {
+  if (!email) return null;
+  return email.toLowerCase().trim();
+}
+
+/**
+ * Update admin email cache in RTDB
+ * @param {string} email - Email address
+ * @param {string} uid - User ID
+ * @param {string} type - Type: "pending" or "active"
+ * @param {boolean} isDelete - Whether to delete the cache entry
+ */
+async function updateAdminEmailCache(email, uid, type, isDelete = false) {
+  if (!email) return;
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail) return;
+
+  try {
+    if (isDelete) {
+      await rtdb.ref(`adminCache/emails/${normalizedEmail}`).remove();
+      console.log(
+          `Removed email ${normalizedEmail} from admin cache`);
+    } else {
+      await rtdb.ref(`adminCache/emails/${normalizedEmail}`).set({
+        uid: uid,
+        type: type,
+        lastUpdated: Date.now(),
+      });
+      console.log(`Updated email ${normalizedEmail} in admin cache`);
+    }
+  } catch (error) {
+    console.error(
+        `Error updating admin email cache for ${normalizedEmail}:`, error);
+    // Non-critical, don't throw
+  }
+}
+
+/**
+ * Update admin participantId cache in RTDB
+ * @param {string} participantId - Participant ID
+ * @param {string} uid - User ID
+ * @param {string} type - Type: "pending" or "active"
+ * @param {boolean} isDelete - Whether to delete the cache entry
+ */
+async function updateAdminParticipantIdCache(
+    participantId, uid, type, isDelete = false) {
+  if (!participantId) return;
+  const normalizedId = participantId.trim();
+  if (!normalizedId) return;
+
+  try {
+    if (isDelete) {
+      await rtdb.ref(`adminCache/participantIds/${normalizedId}`).remove();
+      console.log(
+          `Removed participantId ${normalizedId} from admin cache`);
+    } else {
+      await rtdb.ref(`adminCache/participantIds/${normalizedId}`).set({
+        uid: uid,
+        type: type,
+        lastUpdated: Date.now(),
+      });
+      console.log(
+          `Updated participantId ${normalizedId} in admin cache`);
+    }
+  } catch (error) {
+    console.error(
+        `Error updating admin participantId cache for ${normalizedId}:`,
+        error);
+    // Non-critical, don't throw
+  }
+}
+
+/**
+ * Update admin participants list cache in RTDB
+ * Fetches all pending and active users from Firestore
+ */
+async function updateAdminParticipantsCache() {
+  try {
+    // Fetch pending users
+    const pendingUsersSnapshot = await db.collection("pendingUsers").get();
+    const pendingUsers = [];
+    pendingUsersSnapshot.forEach((doc) => {
+      const data = doc.data();
+      pendingUsers.push({
+        id: doc.id,
+        type: "pending",
+        identifier: doc.id, // email
+        sortDate: data.createdAt ? data.createdAt.toMillis() : 0,
+        ...data,
+      });
+    });
+
+    // Fetch active users
+    const usersSnapshot = await db.collection("users").get();
+    const activeUsers = [];
+    usersSnapshot.forEach((doc) => {
+      const data = doc.data();
+      activeUsers.push({
+        id: doc.id,
+        type: "active",
+        identifier: doc.id, // uid
+        uid: doc.id,
+        sortDate: data.firstLoginAt ? data.firstLoginAt.toMillis() :
+                 data.lastLoginAt ? data.lastLoginAt.toMillis() : 0,
+        ...data,
+      });
+    });
+
+    // Update RTDB cache
+    await rtdb.ref("adminCache/participants").set({
+      pending: pendingUsers,
+      active: activeUsers,
+      lastUpdated: Date.now(),
+    });
+
+    console.log(
+        `Updated admin participants cache: ${pendingUsers.length} pending, ` +
+        `${activeUsers.length} active`);
+  } catch (error) {
+    console.error("Error updating admin participants cache:", error);
+    // Non-critical, don't throw
+  }
+}
+
+/**
  * Update RTDB caches when a user's score changes
  * Triggers: Firestore write to users/{uid} when score field changes
  */
@@ -68,6 +197,51 @@ exports.onUserScoreUpdate = onDocumentUpdated(
         await updateAllUserRanks();
       }
 
+      // Update admin caches if email or participantId changed
+      const emailChanged = before.email !== after.email;
+      const participantIdChanged =
+          before.participantId !== after.participantId;
+      const userDataChanged = emailChanged || participantIdChanged ||
+          before.fullName !== after.fullName ||
+          before.district !== after.district ||
+          before.phone !== after.phone ||
+          before.profession !== after.profession;
+
+      if (emailChanged) {
+        // Remove old email from cache
+        if (before.email) {
+          await updateAdminEmailCache(before.email, uid, "active", true);
+        }
+        // Add new email to cache
+        if (after.email) {
+          await updateAdminEmailCache(after.email, uid, "active");
+        }
+      } else if (after.email) {
+        // Email didn't change, but ensure it's in cache
+        await updateAdminEmailCache(after.email, uid, "active");
+      }
+
+      if (participantIdChanged) {
+        // Remove old participantId from cache
+        if (before.participantId) {
+          await updateAdminParticipantIdCache(
+              before.participantId, uid, "active", true);
+        }
+        // Add new participantId to cache
+        if (after.participantId) {
+          await updateAdminParticipantIdCache(
+              after.participantId, uid, "active");
+        }
+      } else if (after.participantId) {
+        // ParticipantId didn't change, but ensure it's in cache
+        await updateAdminParticipantIdCache(after.participantId, uid, "active");
+      }
+
+      // Update participants list if user data changed
+      if (userDataChanged) {
+        await updateAdminParticipantsCache();
+      }
+
       // Apply all updates
       if (Object.keys(updates).length > 0) {
         await rtdb.ref().update(updates);
@@ -113,10 +287,145 @@ exports.onUserCreate = onDocumentCreated(
       // Also update all user ranks (for leaderboard position)
       await updateAllUserRanks();
 
+      // Update admin caches
+      if (userData.email) {
+        await updateAdminEmailCache(userData.email, uid, "active");
+      }
+      if (userData.participantId) {
+        await updateAdminParticipantIdCache(
+            userData.participantId, uid, "active");
+      }
+      await updateAdminParticipantsCache();
+
       // Apply updates
       if (Object.keys(updates).length > 0) {
         await rtdb.ref().update(updates);
         console.log(`Created RTDB caches for new user ${uid}`);
+      }
+
+      return null;
+    });
+
+/**
+ * Update admin caches when a pending user is created
+ */
+exports.onPendingUserCreate = onDocumentCreated(
+    {
+      document: "pendingUsers/{email}",
+      region: region,
+    },
+    async (event) => {
+      const userData = event.data.data();
+      const email = event.params.email;
+
+      try {
+        // Update admin email cache
+        await updateAdminEmailCache(email, email, "pending");
+        // Update admin participantId cache if exists
+        if (userData.participantId) {
+          await updateAdminParticipantIdCache(
+              userData.participantId, email, "pending");
+        }
+        // Update participants list
+        await updateAdminParticipantsCache();
+        console.log(
+            `Updated admin caches for new pending user ${email}`);
+      } catch (error) {
+        console.error(
+            `Error updating admin caches for pending user ${email}:`,
+            error);
+        // Non-critical, don't throw
+      }
+
+      return null;
+    });
+
+/**
+ * Update admin caches when a pending user is updated
+ */
+exports.onPendingUserUpdate = onDocumentUpdated(
+    {
+      document: "pendingUsers/{email}",
+      region: region,
+    },
+    async (event) => {
+      const before = event.data.before.data();
+      const after = event.data.after.data();
+      const email = event.params.email;
+
+      try {
+        const participantIdChanged =
+            before.participantId !== after.participantId;
+        const userDataChanged = participantIdChanged ||
+            before.fullName !== after.fullName ||
+            before.district !== after.district ||
+            before.phone !== after.phone ||
+            before.profession !== after.profession;
+
+        // Update participantId cache if changed
+        if (participantIdChanged) {
+          // Remove old participantId from cache
+          if (before.participantId) {
+            await updateAdminParticipantIdCache(
+                before.participantId, email, "pending", true);
+          }
+          // Add new participantId to cache
+          if (after.participantId) {
+            await updateAdminParticipantIdCache(
+                after.participantId, email, "pending");
+          }
+        } else if (after.participantId) {
+          // ParticipantId didn't change, but ensure it's in cache
+          await updateAdminParticipantIdCache(
+              after.participantId, email, "pending");
+        }
+
+        // Update participants list if user data changed
+        if (userDataChanged) {
+          await updateAdminParticipantsCache();
+        }
+
+        console.log(
+            `Updated admin caches for pending user ${email}`);
+      } catch (error) {
+        console.error(
+            `Error updating admin caches for pending user ${email}:`,
+            error);
+        // Non-critical, don't throw
+      }
+
+      return null;
+    });
+
+/**
+ * Clean up admin caches when a pending user is deleted
+ */
+exports.onPendingUserDelete = onDocumentDeleted(
+    {
+      document: "pendingUsers/{email}",
+      region: region,
+    },
+    async (event) => {
+      const userData = event.data.data();
+      const email = event.params.email;
+
+      try {
+        // Remove from admin email cache
+        await updateAdminEmailCache(email, email, "pending", true);
+        // Remove from admin participantId cache if exists
+        if (userData.participantId) {
+          await updateAdminParticipantIdCache(
+              userData.participantId, email, "pending", true);
+        }
+        // Update participants list
+        await updateAdminParticipantsCache();
+        console.log(
+            `Cleaned up admin caches for deleted pending user ${email}`);
+      } catch (error) {
+        console.error(
+            `Error cleaning up admin caches for pending user ${email}:`,
+            error);
+        // Non-critical, don't throw
       }
 
       return null;
@@ -147,6 +456,17 @@ exports.onUserDelete = onDocumentDeleted(
       await updateLeaderboardCache();
       // Also update all user ranks (for leaderboard position)
       await updateAllUserRanks();
+
+      // Update admin caches (remove user)
+      if (userData.email) {
+        await updateAdminEmailCache(
+            userData.email, uid, "active", true);
+      }
+      if (userData.participantId) {
+        await updateAdminParticipantIdCache(
+            userData.participantId, uid, "active", true);
+      }
+      await updateAdminParticipantsCache();
 
       // Apply updates
       await rtdb.ref().update(updates);
@@ -335,9 +655,64 @@ exports.refreshAllCaches = onCall(
         // Apply all updates
         await rtdb.ref().update(updates);
 
+        // Refresh admin caches
+        await updateAdminParticipantsCache();
+
+        // Also refresh pending users admin caches
+        const pendingUsersSnapshot = await db.collection("pendingUsers").get();
+        const adminCacheUpdates = {};
+        pendingUsersSnapshot.forEach((doc) => {
+          const data = doc.data();
+          const email = doc.id;
+          if (email) {
+            adminCacheUpdates[`adminCache/emails/${normalizeEmail(email)}`] = {
+              uid: email,
+              type: "pending",
+              lastUpdated: Date.now(),
+            };
+          }
+          if (data.participantId) {
+            const participantIdKeyPending =
+                `adminCache/participantIds/${data.participantId.trim()}`;
+            adminCacheUpdates[participantIdKeyPending] = {
+              uid: email,
+              type: "pending",
+              lastUpdated: Date.now(),
+            };
+          }
+        });
+
+        // Update active users admin caches
+        usersSnapshot.forEach((doc) => {
+          const data = doc.data();
+          const uid = doc.id;
+          if (data.email) {
+            const normalizedEmail = normalizeEmail(data.email);
+            adminCacheUpdates[`adminCache/emails/${normalizedEmail}`] = {
+              uid: uid,
+              type: "active",
+              lastUpdated: Date.now(),
+            };
+          }
+          if (data.participantId) {
+            const participantIdKey =
+                `adminCache/participantIds/${data.participantId.trim()}`;
+            adminCacheUpdates[participantIdKey] = {
+              uid: uid,
+              type: "active",
+              lastUpdated: Date.now(),
+            };
+          }
+        });
+
+        if (Object.keys(adminCacheUpdates).length > 0) {
+          await rtdb.ref().update(adminCacheUpdates);
+        }
+
         return {
           success: true,
-          message: `Refreshed caches for ${usersSnapshot.size} users`,
+          message: `Refreshed caches for ${usersSnapshot.size} users ` +
+                   `and admin caches`,
         };
       } catch (error) {
         console.error("Error refreshing all caches:", error);

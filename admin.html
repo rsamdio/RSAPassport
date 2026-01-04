@@ -262,9 +262,14 @@
             <div class="bg-[#1a2c32] rounded-2xl p-6 border border-white/10">
                 <div class="flex items-center justify-between mb-4">
                     <h2 class="text-xl font-bold">Leaderboard</h2>
-                    <button id="refresh-leaderboard-btn" class="px-4 py-2 bg-primary hover:bg-[#0aa6da] rounded-lg transition-colors">
-                        Refresh
-                    </button>
+                    <div class="flex gap-2">
+                        <button id="refresh-leaderboard-btn" class="px-4 py-2 bg-primary hover:bg-[#0aa6da] rounded-lg transition-colors">
+                            Refresh
+                        </button>
+                        <button id="refresh-all-caches-btn" class="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg transition-colors text-sm">
+                            Refresh All Caches
+                        </button>
+                    </div>
                 </div>
                 <div class="overflow-x-auto">
                     <table class="w-full">

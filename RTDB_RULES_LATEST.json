@@ -18,6 +18,24 @@
         ".write": false
       }
     },
+    "adminCache": {
+      "emails": {
+        "$email": {
+          ".read": "auth != null && root.child('admins').child(auth.uid).exists()",
+          ".write": false
+        }
+      },
+      "participantIds": {
+        "$participantId": {
+          ".read": "auth != null && root.child('admins').child(auth.uid).exists()",
+          ".write": false
+        }
+      },
+      "participants": {
+        ".read": "auth != null && root.child('admins').child(auth.uid).exists()",
+        ".write": false
+      }
+    },
     ".read": false,
     ".write": false
   }
