@@ -1,4 +1,4 @@
-// TODO: Replace with your actual Firebase configuration
+// Firebase configuration
 const firebaseConfig = {
     apiKey: "AIzaSyCdSrZlsg6e7lGMEShA0mqGkNBSggfHBCA",
     authDomain: "eventpasstest.firebaseapp.com",
@@ -90,23 +90,10 @@ let html5QrCode = null;
 // Auth state listener
 onAuthStateChanged(auth, async (user) => {
     if (user) {
-        console.log('User authenticated:', {
-            uid: user.uid,
-            email: user.email,
-            displayName: user.displayName
-        });
-        
         // Check if user is registered and migrate from pendingUsers if needed
         const isParticipant = await checkIfParticipant(user.uid, user.email);
         
-        console.log('Is participant:', isParticipant);
-        
         if (!isParticipant) {
-            console.error('Access denied for user:', {
-                uid: user.uid,
-                email: user.email,
-                normalizedEmail: user.email ? user.email.toLowerCase().trim() : null
-            });
             showAccessDeniedModal();
             await signOut(auth);
             showView('login');
@@ -133,18 +120,11 @@ async function updateRTDBUserData(user) {
         const userRef = doc(db, 'users', user.uid);
         const userSnap = await getDoc(userRef);
         
-        if (!userSnap.exists()) {
-            console.warn('User document does not exist when trying to update RTDB');
+        if (!userSnap.exists() || !userSnap.data().qrToken) {
             return;
         }
         
         const userData = userSnap.data();
-        
-        // qrToken should always exist after migration, but check just in case
-        if (!userData.qrToken) {
-            console.warn('qrToken not found in user document, skipping RTDB update');
-            return;
-        }
         
         // Update RTDB with current auth data
         const qrTokenRef = ref(rtdb, `qrcodes/${userData.qrToken}`);
@@ -166,13 +146,10 @@ async function updateRTDBUserData(user) {
         } catch (localError) {
             // localStorage might be disabled, ignore
         }
-        
-        console.log('RTDB updated successfully for user:', user.uid);
     } catch (error) {
-        console.error('Error updating RTDB user data:', error);
         // Don't throw - RTDB update failure shouldn't block login
         if (error.code === 'PERMISSION_DENIED') {
-            console.error('RTDB permission denied - check RTDB security rules');
+            console.error('RTDB permission denied');
         }
     }
 }
@@ -188,31 +165,19 @@ function generateQRToken() {
 async function checkIfParticipant(uid, email) {
     try {
         if (!email) {
-            console.error('No email provided for user:', uid);
             return false;
         }
         
         // First check if user already exists in users collection
         const userRef = doc(db, 'users', uid);
-        let userSnap;
-        try {
-            userSnap = await getDoc(userRef);
-        } catch (error) {
-            console.error('Error reading users collection:', error);
-            throw error;
-        }
+        const userSnap = await getDoc(userRef);
         
         if (userSnap.exists()) {
-            console.log('User already exists in users collection:', uid);
             return true;
         }
         
         // Check pendingUsers using query approach (more reliable with rules)
         const normalizedEmail = email.toLowerCase().trim();
-        console.log('Checking pendingUsers for email:', normalizedEmail);
-        console.log('User UID:', uid);
-        
-        // Use query instead of getDoc - queries sometimes work better with security rules
         const pendingUsersRef = collection(db, 'pendingUsers');
         const emailQuery = query(pendingUsersRef, where('email', '==', normalizedEmail));
         let querySnapshot;
@@ -220,9 +185,7 @@ async function checkIfParticipant(uid, email) {
         try {
             querySnapshot = await getDocs(emailQuery);
         } catch (error) {
-            console.error('Error querying pendingUsers:', error);
             // Fallback: try direct document access
-            console.log('Trying fallback: direct document access');
             const pendingUserRef = doc(db, 'pendingUsers', normalizedEmail);
             try {
                 const pendingUserSnap = await getDoc(pendingUserRef);
@@ -232,7 +195,6 @@ async function checkIfParticipant(uid, email) {
                     return true;
                 }
             } catch (fallbackError) {
-                console.error('Fallback also failed:', fallbackError);
                 throw error; // Throw original error
             }
             return false;
@@ -245,7 +207,6 @@ async function checkIfParticipant(uid, email) {
             
             // Verify email matches (security check)
             if (pendingData.email && pendingData.email.toLowerCase().trim() !== normalizedEmail) {
-                console.error('Email mismatch in pendingUsers document');
                 return false;
             }
             
@@ -253,27 +214,10 @@ async function checkIfParticipant(uid, email) {
             return true;
         }
         
-        console.log('User not found in pendingUsers. Email checked:', normalizedEmail);
         return false;
     } catch (error) {
-        console.error('Error checking participant status:', error);
-        console.error('Error details:', {
-            code: error.code,
-            message: error.message,
-            uid: uid,
-            email: email,
-            normalizedEmail: email ? email.toLowerCase().trim() : null
-        });
-        
         if (error.code === 'permission-denied') {
-            console.error('PERMISSION DENIED - Check Firestore rules!');
-            console.error('Current user email:', email);
-            console.error('Normalized email:', email ? email.toLowerCase().trim() : null);
-            console.error('Make sure rules allow authenticated users to:');
-            console.error('1. Query pendingUsers collection where email matches');
-            console.error('2. Read pendingUsers documents');
-            console.error('3. Create users/{uid} documents');
-            console.error('4. Delete pendingUsers documents');
+            console.error('Permission denied - check Firestore security rules');
         }
         return false;
     }
@@ -282,8 +226,6 @@ async function checkIfParticipant(uid, email) {
 // Helper function to migrate pending user to active user
 async function migratePendingUser(uid, normalizedEmail, pendingData) {
     try {
-        console.log('Migrating pending user to users collection...');
-        
         const qrToken = pendingData.qrToken;
         if (!qrToken) {
             throw new Error('qrToken missing from pendingUsers document');
@@ -311,7 +253,6 @@ async function migratePendingUser(uid, normalizedEmail, pendingData) {
             qrToken: qrToken, // Store for RTDB updates
             firstLoginAt: serverTimestamp()
         });
-        console.log('Created user document in Firestore');
         
         // Write to RTDB
         const qrTokenRef = ref(rtdb, `qrcodes/${qrToken}`);
@@ -320,19 +261,14 @@ async function migratePendingUser(uid, normalizedEmail, pendingData) {
             name: pendingData.fullName || pendingData.name || 'User',
             photo: null // Will be updated after auth
         });
-        console.log('Wrote QR token to RTDB');
         
-        // Delete from pendingUsers (try by document ID first, then by query result)
+        // Delete from pendingUsers
         try {
             const pendingUserRef = doc(db, 'pendingUsers', normalizedEmail);
             await deleteDoc(pendingUserRef);
-            console.log('Deleted pendingUsers document');
         } catch (deleteError) {
-            console.warn('Could not delete pendingUsers document:', deleteError);
             // Non-critical - user is migrated, pendingUsers entry can be cleaned up later
         }
-        
-        console.log('Successfully migrated user from pendingUsers to users collection');
     } catch (error) {
         console.error('Error during migration:', error);
         throw error;
@@ -371,9 +307,8 @@ async function updateUserOnLogin(user) {
             await updateDoc(userRef, updateData);
         }
     } catch (error) {
-        console.error('Error updating user on login:', error);
         if (error.code === 'permission-denied') {
-            console.error('PERMISSION DENIED - Check Firestore rules!');
+            console.error('Permission denied - check Firestore rules');
         }
     }
 }
@@ -404,7 +339,6 @@ async function calculateRank(score) {
         
         if (ranks.length === 0) {
             // Fallback to default ranks if none configured
-            console.warn('No ranks configured, using default');
             return getDefaultRank(score);
         }
         
@@ -470,11 +404,10 @@ async function loadUserProfile() {
                 if (parsed.timestamp && (Date.now() - parsed.timestamp) < 5 * 60 * 1000) {
                     score = parsed.score;
                     rank = parsed.rank;
-                    console.log('Loaded score/rank from localStorage cache');
                 }
             }
         } catch (localError) {
-            console.log('localStorage cache not available, will use Firestore');
+            // localStorage might be disabled, continue to Firestore
         }
         
         // Get user data using UID as document ID
@@ -515,7 +448,6 @@ async function loadUserProfile() {
                 avatarImg.src = photoURL;
                 avatarImg.style.display = 'block';
                 avatarImg.onerror = function() {
-                    console.warn('Failed to load profile image:', photoURL);
                     avatarImg.style.display = 'none';
                 };
                 if (qrAvatarOverlay) {
@@ -542,8 +474,6 @@ async function loadUserProfile() {
         console.error('Error loading user profile:', error);
         // Only show alert for critical errors, not for non-critical operations
         if (error.code === 'permission-denied') {
-            // Check if it's a critical error (user document read) vs non-critical (fallback operations)
-            console.warn('Permission denied - this may be from a fallback operation. Check console for details.');
             // Don't show alert - profile might still load from cache or other sources
         }
     }
@@ -581,10 +511,9 @@ function displayQRCodeFromDatabase(qrCodeBase64) {
             if (userData && userData.qrToken) {
                 generateQRCodeFallback(userData.qrToken, canvas);
             } else {
-                console.warn('No QR code data available');
             }
-        }).catch(error => {
-            console.warn('Could not load user data for QR fallback:', error);
+        }).catch(() => {
+            // QR code fallback failed, continue without it
         });
     }
 }
@@ -718,7 +647,6 @@ async function loadRecentConnections() {
                 // Check if cache is recent (less than 5 minutes old)
                 if (parsed.timestamp && (Date.now() - parsed.timestamp) < 5 * 60 * 1000) {
                     connections = parsed.connections || [];
-                    console.log('Loaded recent connections from localStorage cache');
                 }
             }
         } catch (localError) {
@@ -859,7 +787,6 @@ async function getUserLeaderboardRank(uid) {
 
         // Fallback: Calculate from Firestore (expensive - reads all users)
         // This should rarely happen if Cloud Functions are working
-        console.warn('RTDB rank cache not found, falling back to Firestore calculation');
         const allUsersRef = collection(db, 'users');
         const allUsersQuery = query(allUsersRef, orderBy('score', 'desc'));
         const allUsersSnap = await getDocs(allUsersQuery);
@@ -1293,7 +1220,7 @@ async function processScan(qrToken) {
         }, 500);
         
     } catch (error) {
-        console.error('Scan error:', error);
+        // Error handling below
         
         // Don't stop scanner - keep it running for better UX
         // The processing flag and debouncing will prevent duplicate scans
@@ -1363,12 +1290,8 @@ function updateLocalStorageAfterScan(uid, newScore, newRank, scanEntry) {
             }));
         } catch (connError) {
             // If we can't update connections cache, that's okay
-            console.warn('Could not update connections cache:', connError);
         }
-        
-        console.log('Updated localStorage cache after scan');
     } catch (error) {
-        console.warn('Error updating localStorage cache after scan:', error);
         // Non-critical, don't throw
     }
 }
@@ -1590,17 +1513,14 @@ async function loadLeaderboard() {
                 .map(key => leaderboardData[key])
                 .filter(p => p !== null); // Filter out null entries
             
-            console.log('Loaded leaderboard from RTDB cache');
         } else {
             // Fallback to Firestore if RTDB cache doesn't exist after retries
-            console.log('RTDB cache not found after retries, falling back to Firestore');
             throw new Error('RTDB_CACHE_MISS');
         }
     } catch (error) {
         // Fallback to Firestore query
         if (error.message === 'RTDB_CACHE_MISS' || error.code === 'PERMISSION_DENIED') {
             try {
-                console.log('Loading leaderboard from Firestore (fallback)');
                 const usersRef = collection(db, 'users');
                 const q = query(usersRef, orderBy('score', 'desc'), limit(10));
                 const querySnapshot = await getDocs(q);
@@ -2032,7 +1952,6 @@ window.saveContactToPhone = async function(connectionData) {
                     // User cancelled, don't show error
                     return;
                 }
-                console.log('Web Share API failed, falling back to download:', shareError);
             }
         }
         
@@ -2051,7 +1970,7 @@ window.saveContactToPhone = async function(connectionData) {
                 showToast('check_circle', `Opening contacts app...`, 'success');
                 return;
             } catch (iosError) {
-                console.log('iOS direct open failed, using download:', iosError);
+                // Fall through to download
             }
         }
         

@@ -42,19 +42,15 @@ async function updateAdminEmailCache(email, uid, type, isDelete = false) {
   try {
     if (isDelete) {
       await rtdb.ref(`adminCache/emails/${normalizedEmail}`).remove();
-      console.log(
-          `Removed email ${normalizedEmail} from admin cache`);
     } else {
       await rtdb.ref(`adminCache/emails/${normalizedEmail}`).set({
         uid: uid,
         type: type,
         lastUpdated: Date.now(),
       });
-      console.log(`Updated email ${normalizedEmail} in admin cache`);
     }
   } catch (error) {
-    console.error(
-        `Error updating admin email cache for ${normalizedEmail}:`, error);
+    console.error(`Error updating admin email cache:`, error);
     // Non-critical, don't throw
   }
 }
@@ -75,21 +71,15 @@ async function updateAdminParticipantIdCache(
   try {
     if (isDelete) {
       await rtdb.ref(`adminCache/participantIds/${normalizedId}`).remove();
-      console.log(
-          `Removed participantId ${normalizedId} from admin cache`);
     } else {
       await rtdb.ref(`adminCache/participantIds/${normalizedId}`).set({
         uid: uid,
         type: type,
         lastUpdated: Date.now(),
       });
-      console.log(
-          `Updated participantId ${normalizedId} in admin cache`);
     }
   } catch (error) {
-    console.error(
-        `Error updating admin participantId cache for ${normalizedId}:`,
-        error);
+    console.error(`Error updating admin participantId cache:`, error);
     // Non-critical, don't throw
   }
 }
@@ -137,9 +127,6 @@ async function updateAdminParticipantsCache() {
       lastUpdated: Date.now(),
     });
 
-    console.log(
-        `Updated admin participants cache: ${pendingUsers.length} pending, ` +
-        `${activeUsers.length} active`);
   } catch (error) {
     console.error("Error updating admin participants cache:", error);
     // Non-critical, don't throw
@@ -245,7 +232,6 @@ exports.onUserScoreUpdate = onDocumentUpdated(
       // Apply all updates
       if (Object.keys(updates).length > 0) {
         await rtdb.ref().update(updates);
-        console.log(`Updated RTDB caches for user ${uid}`);
       }
 
       return null;
@@ -300,7 +286,6 @@ exports.onUserCreate = onDocumentCreated(
       // Apply updates
       if (Object.keys(updates).length > 0) {
         await rtdb.ref().update(updates);
-        console.log(`Created RTDB caches for new user ${uid}`);
       }
 
       return null;
@@ -328,12 +313,8 @@ exports.onPendingUserCreate = onDocumentCreated(
         }
         // Update participants list
         await updateAdminParticipantsCache();
-        console.log(
-            `Updated admin caches for new pending user ${email}`);
       } catch (error) {
-        console.error(
-            `Error updating admin caches for pending user ${email}:`,
-            error);
+        console.error(`Error updating admin caches for pending user:`, error);
         // Non-critical, don't throw
       }
 
@@ -384,13 +365,8 @@ exports.onPendingUserUpdate = onDocumentUpdated(
         if (userDataChanged) {
           await updateAdminParticipantsCache();
         }
-
-        console.log(
-            `Updated admin caches for pending user ${email}`);
       } catch (error) {
-        console.error(
-            `Error updating admin caches for pending user ${email}:`,
-            error);
+        console.error(`Error updating admin caches for pending user:`, error);
         // Non-critical, don't throw
       }
 
@@ -419,12 +395,8 @@ exports.onPendingUserDelete = onDocumentDeleted(
         }
         // Update participants list
         await updateAdminParticipantsCache();
-        console.log(
-            `Cleaned up admin caches for deleted pending user ${email}`);
       } catch (error) {
-        console.error(
-            `Error cleaning up admin caches for pending user ${email}:`,
-            error);
+        console.error(`Error cleaning up admin caches for pending user:`, error);
         // Non-critical, don't throw
       }
 
@@ -470,7 +442,6 @@ exports.onUserDelete = onDocumentDeleted(
 
       // Apply updates
       await rtdb.ref().update(updates);
-      console.log(`Cleaned up RTDB caches for deleted user ${uid}`);
 
       return null;
     });
@@ -509,7 +480,6 @@ async function updateLeaderboardCache() {
     }
 
     await rtdb.ref("leaderboard/top10").set(leaderboardData);
-    console.log("Updated leaderboard cache in RTDB");
   } catch (error) {
     console.error("Error updating leaderboard cache:", error);
     throw error;
@@ -561,8 +531,6 @@ async function updateAllUserRanks() {
     // Batch update all ranks
     if (Object.keys(rankUpdates).length > 0) {
       await rtdb.ref().update(rankUpdates);
-      console.log(
-          `Updated ${Object.keys(rankUpdates).length} user ranks in RTDB`);
     }
   } catch (error) {
     console.error("Error updating all user ranks:", error);

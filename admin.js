@@ -246,13 +246,7 @@ function generateQRToken() {
 // Verify QRCode library is ready
 function verifyQRCodeLibrary() {
     const qrcodeLib = window.qrcodeGenerator || (typeof qrcode !== 'undefined' ? qrcode : null);
-    if (qrcodeLib && typeof qrcodeLib === 'function') {
-        console.log('✓ QRCode library is ready');
-        return true;
-    } else {
-        console.warn('⚠ QRCode library not ready yet');
-        return false;
-    }
+    return qrcodeLib && typeof qrcodeLib === 'function';
 }
 
 // Check library on page load and update UI
@@ -394,8 +388,6 @@ onAuthStateChanged(auth, async (user) => {
                 }
             } else {
                 showLoginPrompt();
-                console.log('User is not an admin. UID:', user.uid);
-                console.log('To grant admin access, add a document in Firestore: admins/' + user.uid);
             }
         } catch (error) {
             console.error('Error checking admin status:', error);
@@ -788,9 +780,8 @@ function parseCSVFile(file) {
                         if (Object.values(participant).some(v => v)) {
                             participants.push(participant);
                         }
-                    } else {
-                        console.warn(`Row ${i + 1} has ${values.length} columns, expected ${headers.length}. Skipping.`);
                     }
+                    // Skip rows with incorrect column count
                 }
                 
                 if (participants.length === 0) {
@@ -1389,17 +1380,14 @@ async function loadParticipants() {
                         ...(cacheData.active || [])
                     ];
                     useCache = true;
-                    console.log('Loaded participants from RTDB cache');
                 }
             }
         } catch (error) {
-            console.warn('Error loading participants from RTDB cache:', error);
             // Fallback to Firestore
         }
         
         // Fallback to Firestore if cache is empty or stale
         if (!useCache) {
-            console.log('Loading participants from Firestore (cache miss or stale)');
             const pendingUsersRef = collection(db, 'pendingUsers');
             const usersRef = collection(db, 'users');
             
@@ -1408,7 +1396,6 @@ async function loadParticipants() {
             try {
                 pendingSnapshot = await getDocs(query(pendingUsersRef, orderBy('createdAt', 'desc')));
             } catch (error) {
-                console.warn('Could not order pendingUsers by createdAt, fetching all:', error);
                 pendingSnapshot = await getDocs(pendingUsersRef);
             }
             
@@ -1417,7 +1404,6 @@ async function loadParticipants() {
             try {
                 usersSnapshot = await getDocs(query(usersRef, orderBy('firstLoginAt', 'desc')));
             } catch (error) {
-                console.warn('Could not order users by firstLoginAt, fetching all:', error);
                 usersSnapshot = await getDocs(usersRef);
             }
             
@@ -1551,17 +1537,14 @@ async function exportAllParticipants() {
                         };
                     });
                     useCache = true;
-                    console.log('Exported participants from RTDB cache');
                 }
             }
         } catch (error) {
-            console.warn('Error loading participants from RTDB cache for export:', error);
             // Fallback to Firestore
         }
         
         // Fallback to Firestore if cache is empty or stale
         if (!useCache) {
-            console.log('Exporting participants from Firestore (cache miss)');
             const pendingUsersRef = collection(db, 'pendingUsers');
             const usersRef = collection(db, 'users');
             
@@ -1570,7 +1553,6 @@ async function exportAllParticipants() {
             try {
                 pendingSnapshot = await getDocs(query(pendingUsersRef, orderBy('createdAt', 'desc')));
             } catch (error) {
-                console.warn('Could not order pendingUsers by createdAt, fetching all:', error);
                 pendingSnapshot = await getDocs(pendingUsersRef);
             }
             
@@ -1579,7 +1561,6 @@ async function exportAllParticipants() {
             try {
                 usersSnapshot = await getDocs(query(usersRef, orderBy('firstLoginAt', 'desc')));
             } catch (error) {
-                console.warn('Could not order users by firstLoginAt, fetching all:', error);
                 usersSnapshot = await getDocs(usersRef);
             }
             
@@ -1714,10 +1695,10 @@ window.viewQRCode = async function(identifier, type) {
                             };
                         }
                     }
+                    }
+                } catch (error) {
+                    // Fallback to Firestore
                 }
-            } catch (error) {
-                console.warn('Error loading from RTDB cache, falling back to Firestore:', error);
-            }
         }
         
         // Fallback to Firestore if cache miss
@@ -1818,16 +1799,14 @@ window.deleteParticipant = async function(identifier, type) {
             
             // Delete from Firestore
             await deleteDoc(participantRef);
-            console.log('Deleted participant document from Firestore');
             
             // Delete from RTDB if qrToken exists
             if (qrToken) {
                 try {
                     const qrTokenRef = ref(rtdb, `qrcodes/${qrToken}`);
                     await rtdbSet(qrTokenRef, null);
-                    console.log('Deleted QR token from RTDB');
                 } catch (rtdbError) {
-                    console.warn('Error deleting from RTDB (non-critical):', rtdbError);
+                    // Non-critical, Cloud Functions will clean up
                 }
             }
             
@@ -1889,7 +1868,6 @@ async function loadLeaderboard() {
                             rank: p.rank || 'N/A'
                         }));
                     useCache = true;
-                    console.log('Loaded leaderboard from RTDB cache');
                     break;
                 }
                 
@@ -1900,7 +1878,6 @@ async function loadLeaderboard() {
                 retryCount++;
             } catch (error) {
                 if (retryCount === maxRetries - 1) {
-                    console.warn('Error loading leaderboard from RTDB cache:', error);
                     break;
                 }
                 await new Promise(resolve => setTimeout(resolve, 100 * (retryCount + 1)));
@@ -1910,7 +1887,6 @@ async function loadLeaderboard() {
         
         // Fallback to Firestore if cache is empty or failed
         if (!useCache || leaderboard.length === 0) {
-            console.log('Loading leaderboard from Firestore (cache miss or empty)');
             const usersRef = collection(db, 'users');
             // Use composite index for tie-breaking: score (desc) then firstLoginAt (asc)
             // Index: Collection: users, Fields: score (Descending), firstLoginAt (Ascending)
