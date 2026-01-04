@@ -1,0 +1,110 @@
+body {
+    min-height: max(884px, 100dvh);
+}
+
+.glass-panel {
+    background: rgba(26, 44, 50, 0.75);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+}
+
+.scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+    display: none;
+}
+
+@keyframes float {
+    0% { transform: translateY(0px); }
+    50% { transform: translateY(-5px); }
+    100% { transform: translateY(0px); }
+}
+
+.animate-float {
+    animation: float 3s ease-in-out infinite;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+    display: none;
+}
+
+.no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+}
+
+/* Subtle toast notification animations */
+@keyframes toastSlideIn {
+    from {
+        opacity: 0;
+        transform: translate(-50%, -10px);
+    }
+    to {
+        opacity: 1;
+        transform: translate(-50%, 0);
+    }
+}
+
+@keyframes toastSlideOut {
+    from {
+        opacity: 1;
+        transform: translate(-50%, 0);
+    }
+    to {
+        opacity: 0;
+        transform: translate(-50%, -10px);
+    }
+}
+
+.toast-show {
+    animation: toastSlideIn 0.2s ease-out forwards;
+}
+
+.toast-hide {
+    animation: toastSlideOut 0.15s ease-in forwards;
+}
+
+/* Logout modal animations */
+#logout-modal > div {
+    transform: scale(0.95);
+    opacity: 0;
+    transition: transform 0.2s ease-out, opacity 0.2s ease-out;
+}
+
+#logout-modal > div.scale-100 {
+    transform: scale(1);
+    opacity: 1;
+}
+
+#logout-modal > div.scale-95 {
+    transform: scale(0.95);
+    opacity: 0;
+}
+
+/* Fix dual/mirrored camera view in QR scanner */
+#qr-reader video,
+#qr-reader canvas {
+    transform: scaleX(1) !important; /* Prevent mirroring */
+    object-fit: cover;
+}
+
+/* Ensure only one video element is visible */
+#qr-reader {
+    position: relative;
+    overflow: hidden;
+}
+
+#qr-reader > div {
+    position: relative;
+}
+
+/* Hide any duplicate video elements */
+#qr-reader video:not(:first-of-type) {
+    display: none !important;
+}
+
