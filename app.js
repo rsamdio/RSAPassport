@@ -1,12 +1,12 @@
 // Firebase configuration
 const firebaseConfig = {
-    apiKey: "AIzaSyCdSrZlsg6e7lGMEShA0mqGkNBSggfHBCA",
-    authDomain: "eventpasstest.firebaseapp.com",
-    projectId: "eventpasstest",
-    storageBucket: "eventpasstest.firebasestorage.app",
-    messagingSenderId: "935026705122",
-    appId: "1:935026705122:web:310e95131223b09938d4bb",
-    databaseURL: "https://eventpasstest-default-rtdb.asia-southeast1.firebasedatabase.app"
+    apiKey: "AIzaSyB2lMtOpxbSGd9dulS5IGUdWN6_hSzoe9w",
+    authDomain: "rsapassport.firebaseapp.com",
+    projectId: "rsapassport",
+    storageBucket: "rsapassport.firebasestorage.app",
+    messagingSenderId: "346221600974",
+    appId: "1:346221600974:web:b35722e12a85947109f09f",
+    databaseURL: "https://rsapassport-default-rtdb.asia-southeast1.firebasedatabase.app"
 };
 
 // Initialize Firebase

@@ -126,7 +126,6 @@ async function updateAdminParticipantsCache() {
       active: activeUsers,
       lastUpdated: Date.now(),
     });
-
   } catch (error) {
     console.error("Error updating admin participants cache:", error);
     // Non-critical, don't throw
@@ -396,7 +395,8 @@ exports.onPendingUserDelete = onDocumentDeleted(
         // Update participants list
         await updateAdminParticipantsCache();
       } catch (error) {
-        console.error(`Error cleaning up admin caches for pending user:`, error);
+        console.error(
+            `Error cleaning up admin caches for pending user:`, error);
         // Non-critical, don't throw
       }
 
