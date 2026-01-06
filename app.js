@@ -40,9 +40,7 @@ import {
 import { 
     getDatabase, 
     ref, 
-    get, 
-    set,
-    update as rtdbUpdate
+    get
 } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js';
 import { deleteDoc } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js';
 
@@ -103,7 +101,7 @@ onAuthStateChanged(auth, async (user) => {
         currentUser = user;
         await updateUserOnLogin(user);
         
-        // Update RTDB with current user's name and photo
+        // Update localStorage cache (RTDB updates handled by Cloud Functions)
         await updateRTDBUserData(user);
         
         await loadUserProfile();
@@ -114,7 +112,8 @@ onAuthStateChanged(auth, async (user) => {
     }
 });
 
-// Update RTDB with user's name and photo from auth
+// Update localStorage cache with user data
+// Note: RTDB updates are handled automatically by Cloud Functions
 async function updateRTDBUserData(user) {
     try {
         const userRef = doc(db, 'users', user.uid);
@@ -126,13 +125,8 @@ async function updateRTDBUserData(user) {
         
         const userData = userSnap.data();
         
-        // Update RTDB with current auth data
-        const qrTokenRef = ref(rtdb, `qrcodes/${userData.qrToken}`);
-        await set(qrTokenRef, {
-            uid: user.uid,
-            name: userData.fullName || user.displayName || userData.displayName || 'User',
-            photo: user.photoURL || null
-        });
+        // Note: RTDB updates are handled by Cloud Functions automatically
+        // when Firestore user documents are updated
         
         // Update localStorage cache (instant, no network)
         const score = userData.score || 0;
@@ -147,10 +141,7 @@ async function updateRTDBUserData(user) {
             // localStorage might be disabled, ignore
         }
     } catch (error) {
-        // Don't throw - RTDB update failure shouldn't block login
-        if (error.code === 'PERMISSION_DENIED') {
-            console.error('RTDB permission denied');
-        }
+        // Non-critical errors are ignored
     }
 }
 
@@ -254,13 +245,8 @@ async function migratePendingUser(uid, normalizedEmail, pendingData) {
             firstLoginAt: serverTimestamp()
         });
         
-        // Write to RTDB
-        const qrTokenRef = ref(rtdb, `qrcodes/${qrToken}`);
-        await set(qrTokenRef, {
-            uid: uid,
-            name: pendingData.fullName || pendingData.name || 'User',
-            photo: null // Will be updated after auth
-        });
+        // Note: RTDB updates are handled by Cloud Functions automatically
+        // when Firestore user documents are created
         
         // Delete from pendingUsers
         try {
@@ -374,6 +360,81 @@ function findRankForScore(score, ranks) {
     }
     
     return getDefaultRank(score);
+}
+
+// Get rank details (minScore, maxScore) for a given rank name
+function getRankDetails(rankName, ranks) {
+    if (!ranks || ranks.length === 0) {
+        // Fallback to default ranks
+        if (rankName === 'Super Star') {
+            return { minScore: 200, maxScore: null };
+        } else if (rankName === 'Connector') {
+            return { minScore: 51, maxScore: 199 };
+        } else {
+            return { minScore: 0, maxScore: 50 };
+        }
+    }
+    
+    const rank = ranks.find(r => r.rankName === rankName);
+    if (rank) {
+        return { minScore: rank.minScore || 0, maxScore: rank.maxScore };
+    }
+    
+    // If rank not found, return default for Rookie
+    return { minScore: 0, maxScore: 50 };
+}
+
+// Calculate progress percentage within current rank
+async function calculateRankProgress(score, rankName) {
+    // Get ranks from cache or use default
+    let ranks = ranksCache;
+    
+    // If cache is empty or stale, try to fetch or use default ranks
+    if (!ranks || ranks.length === 0) {
+        try {
+            // Try to fetch ranks from Firestore
+            const ranksDocRef = doc(db, RANKS_DOC_PATH);
+            const ranksDocSnap = await getDoc(ranksDocRef);
+            
+            if (ranksDocSnap.exists()) {
+                ranks = ranksDocSnap.data().ranks || [];
+                if (ranks.length > 0) {
+                    ranks.sort((a, b) => a.order - b.order);
+                    ranksCache = ranks;
+                    ranksCacheTime = Date.now();
+                }
+            }
+        } catch (error) {
+            // If fetch fails, use default ranks
+        }
+        
+        // If still empty, use default ranks
+        if (!ranks || ranks.length === 0) {
+            ranks = [
+                { rankName: 'Rookie', minScore: 0, maxScore: 50 },
+                { rankName: 'Connector', minScore: 51, maxScore: 199 },
+                { rankName: 'Super Star', minScore: 200, maxScore: null }
+            ];
+        }
+    }
+    
+    const rankDetails = getRankDetails(rankName, ranks);
+    const minScore = rankDetails.minScore;
+    const maxScore = rankDetails.maxScore;
+    
+    // If maxScore is null, it's the highest rank - show 100% if score >= minScore
+    if (maxScore === null || maxScore === undefined) {
+        return score >= minScore ? 100 : 0;
+    }
+    
+    // Calculate progress within the rank range
+    const range = maxScore - minScore;
+    if (range <= 0) {
+        return 100; // If min and max are the same, show 100%
+    }
+    
+    const progress = ((score - minScore) / range) * 100;
+    return Math.min(100, Math.max(0, progress));
 }
 
 // Default rank calculation (fallback)
@@ -656,19 +717,19 @@ async function loadRecentConnections() {
         // If no cache, get from user document (which we already read in loadUserProfile)
         // But we'll get it from the userData we already have if available
         if (connections.length === 0) {
-            const userRef = doc(db, 'users', currentUser.uid);
-            const userSnap = await getDoc(userRef);
-            
-            if (!userSnap.exists()) return;
-            
-            const userData = userSnap.data();
-            const scanHistory = userData.scanHistory || [];
-            
-            // Sort by timestamp (most recent first)
+        const userRef = doc(db, 'users', currentUser.uid);
+        const userSnap = await getDoc(userRef);
+        
+        if (!userSnap.exists()) return;
+        
+        const userData = userSnap.data();
+        const scanHistory = userData.scanHistory || [];
+        
+        // Sort by timestamp (most recent first)
             connections = [...scanHistory].sort((a, b) => {
-                const timeA = a.scannedAt ? (typeof a.scannedAt === 'string' ? new Date(a.scannedAt).getTime() : a.scannedAt.toMillis()) : 0;
-                const timeB = b.scannedAt ? (typeof b.scannedAt === 'string' ? new Date(b.scannedAt).getTime() : b.scannedAt.toMillis()) : 0;
-                return timeB - timeA;
+            const timeA = a.scannedAt ? (typeof a.scannedAt === 'string' ? new Date(a.scannedAt).getTime() : a.scannedAt.toMillis()) : 0;
+            const timeB = b.scannedAt ? (typeof b.scannedAt === 'string' ? new Date(b.scannedAt).getTime() : b.scannedAt.toMillis()) : 0;
+            return timeB - timeA;
             }).slice(0, 3);
             
             // Update localStorage cache (instant, no network cost)
@@ -708,10 +769,10 @@ async function loadRecentConnections() {
                     const userData = userSnap.data();
                     const totalConnections = (userData.scanHistory || []).length;
                     if (totalConnections > 3) {
-                        const more = document.createElement('div');
-                        more.className = 'h-12 w-12 rounded-full ring-4 ring-background-dark bg-surface-dark flex items-center justify-center border border-white/10 text-xs font-bold text-slate-400';
+            const more = document.createElement('div');
+            more.className = 'h-12 w-12 rounded-full ring-4 ring-background-dark bg-surface-dark flex items-center justify-center border border-white/10 text-xs font-bold text-slate-400';
                         more.textContent = `+${totalConnections - 3}`;
-                        container.appendChild(more);
+            container.appendChild(more);
                     }
                 }
             } catch (err) {
@@ -1523,16 +1584,16 @@ async function loadLeaderboard() {
             try {
                 const usersRef = collection(db, 'users');
                 const q = query(usersRef, orderBy('score', 'desc'), limit(10));
-                const querySnapshot = await getDocs(q);
-                
+        const querySnapshot = await getDocs(q);
+        
                 participants = [];
-                querySnapshot.forEach((doc) => {
-                    const data = doc.data();
-                    participants.push({
-                        uid: doc.id,
-                        ...data
-                    });
-                });
+        querySnapshot.forEach((doc) => {
+            const data = doc.data();
+            participants.push({
+                uid: doc.id,
+                ...data
+            });
+        });
                 
                 // Note: RTDB cache updates are handled automatically by Cloud Functions
                 // No need to update cache from client side
@@ -1545,36 +1606,36 @@ async function loadLeaderboard() {
             return;
         }
     }
-    
-    // Display top 3
-    const topThreeContainer = document.getElementById('top-three-container');
-    topThreeContainer.innerHTML = '';
-    
-    if (participants.length >= 3) {
-        // Second place
-        createTopThreeCard(participants[1], 2, topThreeContainer);
-        // First place
-        createTopThreeCard(participants[0], 1, topThreeContainer);
-        // Third place
-        createTopThreeCard(participants[2], 3, topThreeContainer);
-    } else {
-        participants.forEach((participant, index) => {
-            createTopThreeCard(participant, index + 1, topThreeContainer);
+        
+        // Display top 3
+        const topThreeContainer = document.getElementById('top-three-container');
+        topThreeContainer.innerHTML = '';
+        
+        if (participants.length >= 3) {
+            // Second place
+            createTopThreeCard(participants[1], 2, topThreeContainer);
+            // First place
+            createTopThreeCard(participants[0], 1, topThreeContainer);
+            // Third place
+            createTopThreeCard(participants[2], 3, topThreeContainer);
+        } else {
+            participants.forEach((participant, index) => {
+                createTopThreeCard(participant, index + 1, topThreeContainer);
+            });
+        }
+        
+        // Display rest of leaderboard
+        const leaderboardList = document.getElementById('leaderboard-list');
+        leaderboardList.innerHTML = '';
+        
+        participants.slice(3).forEach((participant, index) => {
+            const rank = index + 4;
+            const item = createLeaderboardItem(participant, rank);
+            leaderboardList.appendChild(item);
         });
-    }
-    
-    // Display rest of leaderboard
-    const leaderboardList = document.getElementById('leaderboard-list');
-    leaderboardList.innerHTML = '';
-    
-    participants.slice(3).forEach((participant, index) => {
-        const rank = index + 4;
-        const item = createLeaderboardItem(participant, rank);
-        leaderboardList.appendChild(item);
-    });
-    
-    // Display current user footer
-    await loadCurrentUserFooter(participants);
+        
+        // Display current user footer
+        await loadCurrentUserFooter(participants);
 }
 
 // Update leaderboard cache in RTDB (called after score changes)
@@ -1602,8 +1663,8 @@ function createTopThreeCard(participant, rank, container) {
                     ${photoURL ? 
                         `<img src="${photoURL}" alt="${participant.fullName || participant.displayName || participant.name || 'User'}" class="w-full h-full object-cover rounded-full" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
                          <div class="absolute inset-0 bg-gradient-to-br from-yellow-300 via-orange-400 to-red-500 flex items-center justify-center text-white text-3xl font-black" style="display: none;">
-                             <div class="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] opacity-20"></div>
-                             <span class="relative z-10">${initials}</span>
+                    <div class="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] opacity-20"></div>
+                    <span class="relative z-10">${initials}</span>
                          </div>` :
                         `<div class="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] opacity-20"></div>
                          <span class="relative z-10">${initials}</span>`
@@ -1712,6 +1773,11 @@ async function loadCurrentUserFooter(leaderboardParticipants) {
         const footer = document.getElementById('current-user-footer');
         if (!footer) return;
         
+        // Calculate progress within current rank
+        const currentRank = userData.rank || 'Rookie';
+        const currentScore = userData.score || 0;
+        const rankProgress = await calculateRankProgress(currentScore, currentRank);
+        
         footer.innerHTML = `
         <div class="relative overflow-hidden bg-[#1a2c32]/95 backdrop-blur-xl rounded-2xl shadow-2xl border border-white/10 p-1">
             <div class="absolute inset-0 bg-gradient-to-r from-primary/10 to-purple-500/10 opacity-50"></div>
@@ -1725,7 +1791,7 @@ async function loadCurrentUserFooter(leaderboardParticipants) {
                         ${photoURL ? 
                             `<img src="${photoURL}" alt="${userData.fullName || userData.displayName || 'User'}" class="w-full h-full object-cover rounded-full" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
                              <div class="absolute inset-0 bg-gradient-to-br from-slate-700 to-slate-900 flex items-center justify-center text-white text-lg font-bold" style="display: none;">
-                                 <span class="text-primary">${initials}</span>
+                        <span class="text-primary">${initials}</span>
                              </div>` :
                             `<span class="text-primary">${initials}</span>`
                         }
@@ -1739,7 +1805,7 @@ async function loadCurrentUserFooter(leaderboardParticipants) {
                     </div>
                     <div class="flex items-center gap-2">
                         <div class="h-2 flex-1 bg-slate-700/50 rounded-full overflow-hidden backdrop-blur-sm">
-                            <div class="h-full bg-gradient-to-r from-primary to-blue-500 rounded-full shadow-[0_0_10px_rgba(13,185,242,0.5)]" style="width: ${Math.min(100, ((userData.score || 0) / 200) * 100)}%"></div>
+                            <div class="h-full bg-gradient-to-r from-primary to-blue-500 rounded-full shadow-[0_0_10px_rgba(13,185,242,0.5)]" style="width: ${rankProgress}%"></div>
                         </div>
                     </div>
                     <p class="text-[9px] text-white/70 mt-1">
@@ -1928,13 +1994,13 @@ window.saveContactToPhone = async function(connectionData) {
             try {
                 // Check if we can share files
                 if (navigator.canShare && navigator.canShare({ files: [file] })) {
-                    await navigator.share({
+                await navigator.share({
                         title: `Add ${connection.name} to Contacts`,
-                        text: `Save ${connection.name} to your contacts`,
-                        files: [file]
-                    });
+                    text: `Save ${connection.name} to your contacts`,
+                    files: [file]
+                });
                     showToast('check_circle', `Opening contacts app...`, 'success');
-                    return;
+                return;
                 } else {
                     // Fallback: Share text with vCard data URI
                     const vCardDataUri = `data:text/vcard;charset=utf-8,${encodeURIComponent(vCard)}`;
@@ -1985,8 +2051,8 @@ window.saveContactToPhone = async function(connectionData) {
         
         // Clean up after a short delay
         setTimeout(() => {
-            document.body.removeChild(link);
-            URL.revokeObjectURL(url);
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
         }, 100);
         
         // Show success message with instructions for desktop
