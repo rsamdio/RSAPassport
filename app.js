@@ -1684,6 +1684,12 @@ async function processScan(qrToken) {
         }
         
         const targetData = qrTokenSnap.val();
+        
+        // Validate targetData has required fields
+        if (!targetData || !targetData.uid) {
+            throw new Error('Invalid QR code data');
+        }
+        
         const targetUid = targetData.uid;
         
         // Step 2: Check if scanning self
@@ -1715,14 +1721,15 @@ async function processScan(qrToken) {
         const batchId = getCurrentBatchId();
         
         // Step 5: Record scan in RTDB using transaction for atomicity
+        // Ensure all metadata fields are null (not undefined) - RTDB doesn't allow undefined
         const updates = {
             [`scans/byScanner/${scannerUid}/${targetUid}`]: {
                 scannedAt: scanTimestamp,
                 points: 10,
                 metadata: {
-                    name: targetData.name,
-                    photo: targetData.photo,
-                    district: targetData.district
+                    name: targetData.name || null,
+                    photo: targetData.photo !== undefined ? targetData.photo : null,
+                    district: targetData.district || null
                 }
             },
             // Note: scans/pending is write-protected (Cloud Functions only)
@@ -1740,13 +1747,22 @@ async function processScan(qrToken) {
         await update(ref(rtdb), updates);
         
         // Step 6: Update recent scans cache (optimistic)
-        await updateRecentScansCache(scannerUid, targetUid, targetData);
+        // Ensure targetData has all required fields with null fallbacks
+        const safeTargetData = {
+            name: targetData.name || null,
+            photo: targetData.photo !== undefined ? targetData.photo : null,
+            district: targetData.district || null,
+            email: targetData.email || null,
+            phone: targetData.phone || null,
+            profession: targetData.profession || null
+        };
+        await updateRecentScansCache(scannerUid, targetUid, safeTargetData);
         
         // Step 7: Update localStorage cache
         updateLocalStorageAfterScan(scannerUid, newScore, newRank, {
             uid: targetUid,
-            name: targetData.name,
-            photo: targetData.photo
+            name: safeTargetData.name,
+            photo: safeTargetData.photo
         });
         
         // Show subtle success notification

@@ -947,22 +947,41 @@ async function bulkImportParticipants(participants) {
                 continue;
             }
             
-            // Generate QR token and code
-            const qrToken = generateQRToken();
-            const qrCodeBase64 = await generateQRCodeBase64(qrToken);
-            
-            // Create pending user in RTDB
+            // Validate and normalize data
             const email = participant.Email.trim().toLowerCase();
             const normalizedEmail = normalizeEmail(email);
             const encodedEmail = encodeEmailForPath(normalizedEmail);
+            const participantId = participant.ParticipantID.trim();
+            const fullName = participant.FullName.trim();
+            const district = participant.District.trim();
+            const phone = participant.Phone.trim();
+            const profession = participant.Profession.trim();
+            
+            // Validate all fields are present after trimming
+            if (!participantId || !fullName || !district || !normalizedEmail || !phone || !profession) {
+                throw new Error('One or more required fields are empty after trimming');
+            }
+            
+            // Generate QR token and code
+            const qrToken = generateQRToken();
+            if (!qrToken || qrToken.length !== 32) {
+                throw new Error('Failed to generate valid QR token');
+            }
+            
+            const qrCodeBase64 = await generateQRCodeBase64(qrToken);
+            if (!qrCodeBase64) {
+                throw new Error('Failed to generate QR code');
+            }
+            
+            // Create pending user in RTDB
             const pendingUserRef = ref(rtdb, `pendingUsers/${encodedEmail}`);
             await set(pendingUserRef, {
-                participantId: participant.ParticipantID.trim(),
-                fullName: participant.FullName.trim(),
-                district: participant.District.trim(),
+                participantId: participantId,
+                fullName: fullName,
+                district: district,
                 email: normalizedEmail,
-                phone: participant.Phone.trim(),
-                profession: participant.Profession.trim(),
+                phone: phone,
+                profession: profession,
                 qrToken: qrToken,
                 qrCodeBase64: qrCodeBase64,
                 createdAt: Date.now(),
@@ -977,7 +996,7 @@ async function bulkImportParticipants(participants) {
                     type: 'pending',
                     lastUpdated: Date.now()
                 },
-                [`indexes/participantIds/${participant.ParticipantID.trim()}`]: {
+                [`indexes/participantIds/${participantId}`]: {
                     uid: encodedEmail,
                     email: normalizedEmail,
                     type: 'pending',
@@ -990,26 +1009,42 @@ async function bulkImportParticipants(participants) {
                 }
             });
             
-            // Update QR code cache
+            // Update QR code cache - ensure all fields are explicitly set (null, not undefined)
             await set(ref(rtdb, `qrcodes/${qrToken}`), {
                 uid: normalizedEmail,
-                name: participant.FullName.trim(),
-                photo: null,
+                name: fullName,
+                photo: null, // Explicitly null for pending users (no photo until login)
                 email: normalizedEmail,
-                district: participant.District.trim(),
-                phone: participant.Phone.trim(),
-                profession: participant.Profession.trim()
+                district: district,
+                phone: phone,
+                profession: profession
             });
+            
+            // Verify QR code was created successfully
+            const qrCodeVerifyRef = ref(rtdb, `qrcodes/${qrToken}`);
+            const qrCodeVerifySnap = await get(qrCodeVerifyRef);
+            if (!qrCodeVerifySnap.exists()) {
+                throw new Error('QR code cache verification failed');
+            }
             
             results.success.push({
                 row: i + 2,
                 participant: participant
             });
         } catch (error) {
+            // Provide more detailed error messages
+            let errorMessage = error.message;
+            if (error.code) {
+                errorMessage += ` (Code: ${error.code})`;
+            }
+            if (error.stack && error.message.includes('RTDB')) {
+                errorMessage += ' - Database operation failed';
+            }
+            
             results.errors.push({
                 row: i + 2,
                 participant: participant,
-                errors: [error.message]
+                errors: [errorMessage]
             });
         }
     }
