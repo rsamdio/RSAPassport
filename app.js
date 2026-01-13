@@ -668,6 +668,9 @@ async function updateRecentScansCache(scannerUid, scannedUid, qrData) {
             name: qrData.name,
             photo: qrData.photo,
             district: qrData.district,
+            email: qrData.email || null,
+            phone: qrData.phone || null,
+            profession: qrData.profession || null,
             scannedAt: Date.now()
         });
         
@@ -2417,9 +2420,32 @@ async function loadHistory() {
                     name: conn.name,
                     photo: conn.photo,
                     district: conn.district,
+                    email: conn.email || null,
+                    phone: conn.phone || null,
+                    profession: conn.profession || null,
                     scannedAt: conn.scannedAt
                 }))
                 .sort((a, b) => (b.scannedAt || 0) - (a.scannedAt || 0));
+            
+            // For connections missing email/phone, try to fetch from users collection
+            const connectionsNeedingData = connections.filter(conn => !conn.email && !conn.phone && conn.uid);
+            if (connectionsNeedingData.length > 0) {
+                await Promise.all(connectionsNeedingData.map(async (conn) => {
+                    try {
+                        const userRef = ref(rtdb, `users/${conn.uid}`);
+                        const userSnap = await get(userRef);
+                        if (userSnap.exists()) {
+                            const userData = userSnap.val();
+                            const profile = userData.profile || {};
+                            conn.email = conn.email || userData.email || profile.email || null;
+                            conn.phone = conn.phone || profile.phone || null;
+                            conn.profession = conn.profession || profile.profession || null;
+                        }
+                    } catch (error) {
+                        // Non-critical, continue
+                    }
+                }));
+            }
         }
     
     const historyList = document.getElementById('history-list');
