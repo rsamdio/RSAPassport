@@ -990,15 +990,36 @@ exports.onUserCreated = onValueCreated(
       const userData = event.data.val();
 
       try {
+        // For new users, ensure photoURL is synced from Firebase Auth
+        // This handles cases where user was just created and photoURL might not be in RTDB yet
+        let profile = userData.profile || {};
+        let photoURL = profile.photoURL || userData.photoURL || null;
+        
+        // If photoURL is missing, fetch from Firebase Auth immediately
+        if (!photoURL) {
+          try {
+            const authUser = await admin.auth().getUser(uid).catch(() => null);
+            if (authUser && authUser.photoURL) {
+              photoURL = authUser.photoURL;
+              // Update RTDB with photoURL from Firebase Auth
+              profile = {...profile, photoURL: photoURL};
+              await rtdb.ref(`users/${uid}`).update({
+                profile: profile,
+              });
+            }
+          } catch (authError) {
+            // Auth read failed, continue with existing data
+          }
+        }
+
         // Create/update QR code entry in RTDB if qrToken exists
         if (userData.qrToken) {
-          const profile = userData.profile || {};
           const qrCodeRef = rtdb.ref(`qrcodes/${userData.qrToken}`);
           await qrCodeRef.set({
             uid: uid,
             name: profile.fullName || profile.displayName ||
                   userData.fullName || userData.displayName || "User",
-            photo: profile.photoURL || userData.photoURL || null,
+            photo: photoURL || null,
             email: userData.email || null,
             district: profile.district || userData.district || null,
             phone: profile.phone || userData.phone || null,
@@ -1006,8 +1027,14 @@ exports.onUserCreated = onValueCreated(
           });
         }
 
+        // Update userData with synced photoURL for admin cache
+        const updatedUserData = {
+          ...userData,
+          profile: profile,
+        };
+
         // Add user to active cache
-        await updateAdminCacheIncremental(uid, "active", userData);
+        await updateAdminCacheIncremental(uid, "active", updatedUserData);
 
         // Update sorted score index
         await updateSortedScoreIndex([uid]);
@@ -1038,9 +1065,29 @@ exports.onUserUpdated = onValueUpdated(
       const previousData = event.data.before.val();
 
       try {
+        // Ensure photoURL is synced from Firebase Auth if missing
+        let profile = userData.profile || {};
+        let photoURL = profile.photoURL || userData.photoURL || null;
+        
+        // If photoURL is missing, fetch from Firebase Auth
+        if (!photoURL) {
+          try {
+            const authUser = await admin.auth().getUser(uid).catch(() => null);
+            if (authUser && authUser.photoURL) {
+              photoURL = authUser.photoURL;
+              // Update RTDB with photoURL from Firebase Auth
+              profile = {...profile, photoURL: photoURL};
+              await rtdb.ref(`users/${uid}`).update({
+                profile: profile,
+              });
+            }
+          } catch (authError) {
+            // Auth read failed, continue with existing data
+          }
+        }
+
         // Update QR code entry if qrToken exists and profile data changed
         if (userData.qrToken) {
-          const profile = userData.profile || {};
           const previousProfile = previousData.profile || {};
           const profileChanged = (
             profile.fullName !== previousProfile.fullName ||
@@ -1057,7 +1104,7 @@ exports.onUserUpdated = onValueUpdated(
               uid: uid,
               name: profile.fullName || profile.displayName ||
                     userData.fullName || userData.displayName || "User",
-              photo: profile.photoURL || userData.photoURL || null,
+              photo: photoURL || null,
               email: userData.email || null,
               district: profile.district || userData.district || null,
               phone: profile.phone || userData.phone || null,
@@ -1066,8 +1113,14 @@ exports.onUserUpdated = onValueUpdated(
           }
         }
 
+        // Update userData with synced photoURL for admin cache
+        const updatedUserData = {
+          ...userData,
+          profile: profile,
+        };
+
         // Update admin cache
-        await updateAdminCacheIncremental(uid, "active", userData);
+        await updateAdminCacheIncremental(uid, "active", updatedUserData);
 
         // If score changed, update ranks and leaderboard
         const scoreChanged = (userData.score || 0) !==
@@ -1300,6 +1353,49 @@ exports.deleteUser = onCall(
           await rtdb.ref(`ranks/${uid}`).remove();
         } catch (rankError) {
           // Non-critical
+        }
+
+        // Delete connection history
+        // Only delete for active users (pending users don't have scan history)
+        if (type === "active") {
+          try {
+            // 1. Delete user's own recent scans (their connection history)
+            await rtdb.ref(`scans/recent/${uid}`).remove();
+
+            // 2. Delete all scans where this user was the scanner
+            // This deletes scans/byScanner/${uid}/* (all scans they made)
+            await rtdb.ref(`scans/byScanner/${uid}`).remove();
+
+            // 3. Delete all scans where this user was the target (scanned by others)
+            // Need to iterate through all scanners and remove this user from their scan records
+            const byScannerRef = rtdb.ref("scans/byScanner");
+            const byScannerSnap = await byScannerRef.once("value");
+
+            if (byScannerSnap.exists()) {
+              const updates = {};
+              byScannerSnap.forEach((scannerSnapshot) => {
+                const scannerUid = scannerSnapshot.key;
+                // Skip if this is the user being deleted (already handled above)
+                if (scannerUid !== uid) {
+                  // Check if this scanner has scanned the deleted user
+                  // scannerSnapshot is a DataSnapshot, so we can check for child
+                  const targetScanSnapshot = scannerSnapshot.child(uid);
+                  if (targetScanSnapshot.exists()) {
+                    // Add to updates to remove this scan record
+                    updates[`scans/byScanner/${scannerUid}/${uid}`] = null;
+                  }
+                }
+              });
+
+              // Apply updates to remove this user from all other users' scan records
+              if (Object.keys(updates).length > 0) {
+                await rtdb.ref().update(updates);
+              }
+            }
+          } catch (scanError) {
+            // Non-critical - connection history deletion failed
+            // Continue with user deletion
+          }
         }
 
         // RTDB triggers will automatically:

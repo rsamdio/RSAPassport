@@ -690,8 +690,27 @@ document.getElementById('add-participant-form').addEventListener('submit', async
             profession: profession
         });
         
+        // Step 4: Wait for RTDB trigger (onPendingUserCreated) to complete
+        // This ensures admin cache is updated before showing success
         // RTDB triggers (onPendingUserCreated) will automatically update admin cache
-        // No need for client-side cache updates - triggers handle this
+        await new Promise(resolve => setTimeout(resolve, 800));
+        
+        // Optional: Verify admin cache was updated
+        try {
+            const adminCacheRef = ref(rtdb, 'adminCache/participants');
+            const adminCacheSnap = await get(adminCacheRef);
+            if (adminCacheSnap.exists()) {
+                const cache = adminCacheSnap.val();
+                const pendingUsers = cache.pending || [];
+                const userInCache = pendingUsers.find(p => p.id === encodedEmail);
+                if (!userInCache) {
+                    // Cache might not be updated yet, wait a bit more
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                }
+            }
+        } catch (cacheCheckError) {
+            // Non-critical - cache check failed, but continue
+        }
         
         showAlert('Success', 'Participant added successfully!', 'success');
         
@@ -699,10 +718,8 @@ document.getElementById('add-participant-form').addEventListener('submit', async
         document.getElementById('add-participant-form').reset();
         
         // Reload participants list if on manage tab
-        // Wait a bit for RTDB triggers to process before refreshing
+        // Additional wait to ensure cache is fully updated
         if (currentTab === 'manage') {
-            // Wait for RTDB triggers to process (they run asynchronously)
-            await new Promise(resolve => setTimeout(resolve, 1000));
             await loadParticipants(true);
         }
         
@@ -928,6 +945,8 @@ async function bulkImportParticipants(participants) {
     
     const total = participants.length;
     
+    // Process participants sequentially (one at a time) to ensure each completes fully
+    // This matches the individual add flow and ensures RTDB triggers complete
     for (let i = 0; i < participants.length; i++) {
         const participant = participants[i];
         const progress = ((i + 1) / total) * 100;
@@ -936,7 +955,7 @@ async function bulkImportParticipants(participants) {
         progressText.textContent = `${i + 1} of ${total}`;
         
         try {
-            // Validate row
+            // Step 1: Validate row
             const rowErrors = validateCSVRow(participant, i);
             if (rowErrors.length > 0) {
                 results.errors.push({
@@ -944,10 +963,10 @@ async function bulkImportParticipants(participants) {
                     participant: participant,
                     errors: rowErrors
                 });
-                continue;
+                continue; // Skip to next participant
             }
             
-            // Validate and normalize data
+            // Step 2: Validate and normalize data
             const email = participant.Email.trim().toLowerCase();
             const normalizedEmail = normalizeEmail(email);
             const encodedEmail = encodeEmailForPath(normalizedEmail);
@@ -962,7 +981,7 @@ async function bulkImportParticipants(participants) {
                 throw new Error('One or more required fields are empty after trimming');
             }
             
-            // Generate QR token and code
+            // Step 3: Generate QR token and code
             const qrToken = generateQRToken();
             if (!qrToken || qrToken.length !== 32) {
                 throw new Error('Failed to generate valid QR token');
@@ -973,7 +992,8 @@ async function bulkImportParticipants(participants) {
                 throw new Error('Failed to generate QR code');
             }
             
-            // Create pending user in RTDB
+            // Step 4: Create pending user in RTDB
+            // This triggers onPendingUserCreated which updates admin cache
             const pendingUserRef = ref(rtdb, `pendingUsers/${encodedEmail}`);
             await set(pendingUserRef, {
                 participantId: participantId,
@@ -988,7 +1008,7 @@ async function bulkImportParticipants(participants) {
                 status: 'pending'
             });
             
-            // Update indexes (use encoded email in path)
+            // Step 5: Update indexes (use encoded email in path)
             await update(ref(rtdb), {
                 [`indexes/emails/${encodedEmail}`]: {
                     uid: encodedEmail,
@@ -1009,7 +1029,7 @@ async function bulkImportParticipants(participants) {
                 }
             });
             
-            // Update QR code cache - ensure all fields are explicitly set (null, not undefined)
+            // Step 6: Update QR code cache - ensure all fields are explicitly set (null, not undefined)
             await set(ref(rtdb, `qrcodes/${qrToken}`), {
                 uid: normalizedEmail,
                 name: fullName,
@@ -1020,17 +1040,43 @@ async function bulkImportParticipants(participants) {
                 profession: profession
             });
             
-            // Verify QR code was created successfully
+            // Step 7: Verify QR code was created successfully
             const qrCodeVerifyRef = ref(rtdb, `qrcodes/${qrToken}`);
             const qrCodeVerifySnap = await get(qrCodeVerifyRef);
             if (!qrCodeVerifySnap.exists()) {
                 throw new Error('QR code cache verification failed');
             }
             
+            // Step 8: Wait for RTDB trigger (onPendingUserCreated) to complete
+            // This ensures admin cache is updated before moving to next participant
+            // Wait a bit for the trigger to process (triggers are async but usually fast)
+            await new Promise(resolve => setTimeout(resolve, 800));
+            
+            // Step 9: Verify admin cache was updated (optional verification)
+            // Check if participant appears in admin cache
+            try {
+                const adminCacheRef = ref(rtdb, 'adminCache/participants');
+                const adminCacheSnap = await get(adminCacheRef);
+                if (adminCacheSnap.exists()) {
+                    const cache = adminCacheSnap.val();
+                    const pendingUsers = cache.pending || [];
+                    const userInCache = pendingUsers.find(p => p.id === encodedEmail);
+                    if (!userInCache) {
+                        // Cache might not be updated yet, wait a bit more
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                    }
+                }
+            } catch (cacheCheckError) {
+                // Non-critical - cache check failed, but continue
+                // RTDB trigger will eventually update it
+            }
+            
+            // Step 10: Mark as successful
             results.success.push({
                 row: i + 2,
                 participant: participant
             });
+            
         } catch (error) {
             // Provide more detailed error messages
             let errorMessage = error.message;

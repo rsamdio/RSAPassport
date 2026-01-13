@@ -111,6 +111,40 @@ onAuthStateChanged(auth, async (user) => {
         // RTDB triggers will automatically update admin cache in real-time
         await updateUserOnLogin(user);
         
+        // Check if this is a new user and aggressively clear connection history
+        // This ensures deleted users who are re-added don't have old connection history
+        const userRTDBRef = ref(rtdb, `users/${user.uid}`);
+        const userRTDBSnap = await get(userRTDBRef);
+        let shouldClearHistory = false;
+        
+        if (userRTDBSnap.exists()) {
+            const userData = userRTDBSnap.val();
+            const score = userData.score || 0;
+            const firstLoginAt = userData.firstLoginAt;
+            
+            // Clear history if:
+            // 1. User has score 0 (new user with no scans yet) - most reliable indicator
+            // 2. OR user was created very recently (within 60 seconds)
+            if (score === 0) {
+                shouldClearHistory = true;
+            } else if (firstLoginAt && (Date.now() - firstLoginAt) < 60000) {
+                shouldClearHistory = true;
+            }
+        }
+        
+        // Aggressively clear connection history for new/fresh users
+        if (shouldClearHistory) {
+            try {
+                // Force clear RTDB connection history
+                await set(ref(rtdb, `scans/recent/${user.uid}`), []);
+                
+                // Clear localStorage cache for connection history
+                localStorage.removeItem(`user_${user.uid}_recentConnections`);
+            } catch (historyError) {
+                // Non-critical - continue even if history clearing fails
+            }
+        }
+        
         // Update localStorage cache
         await updateRTDBUserData(user);
         
@@ -307,65 +341,128 @@ async function migratePendingUser(uid, normalizedEmail, pendingData) {
         const encodedEmail = encodeEmailForPath(normalizedEmail);
         const userRTDBRef = ref(rtdb, `users/${uid}`);
         
-        // Get photoURL and displayName from currentUser immediately (from Firebase Auth)
-        // This ensures photos are available instantly on first login
-        const authPhotoURL = currentUser && currentUser.photoURL ? currentUser.photoURL : null;
-        const authDisplayName = currentUser && currentUser.displayName ? currentUser.displayName : null;
+        // Get photoURL and displayName from currentUser (from Firebase Auth)
+        // For new logins, Firebase Auth might need a moment to load profile data
+        let authPhotoURL = null;
+        let authDisplayName = null;
         
-        await set(userRTDBRef, {
-            email: normalizedEmail,
-            participantId: pendingData.participantId || null,
-            qrToken: qrToken,
-            qrCodeBase64: pendingData.qrCodeBase64 || null,
-            score: 0,
-            rank: initialRank,
-            profile: {
-                fullName: pendingData.fullName || null,
-                district: pendingData.district || null,
-                phone: pendingData.phone || null,
-                profession: pendingData.profession || null,
-                photoURL: authPhotoURL, // Immediately sync from Firebase Auth
-                displayName: authDisplayName, // Immediately sync from Firebase Auth
-            },
-            firstLoginAt: Date.now(),
-            lastLoginAt: Date.now(),
-        });
+        // Try to get from currentUser immediately
+        if (currentUser) {
+            authPhotoURL = currentUser.photoURL || null;
+            authDisplayName = currentUser.displayName || null;
+        }
         
-        // Update QR code entry in RTDB to use actual uid instead of encoded email
-        // This is critical for scanning to work correctly
-        const qrCodeRef = ref(rtdb, `qrcodes/${qrToken}`);
-        const qrCodeSnap = await get(qrCodeRef);
+        // If photoURL is still missing, wait and retry (Firebase Auth profile might still be loading)
+        // This is especially important for OAuth providers (Google, etc.) in incognito mode
+        if (!authPhotoURL && currentUser) {
+            // Wait for Firebase Auth to fully load profile data
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            // Re-check currentUser (profile data might have loaded)
+            authPhotoURL = currentUser.photoURL || null;
+            authDisplayName = currentUser.displayName || null;
+        }
+        
+        // If still missing, try reloading the user to get fresh data
+        if (!authPhotoURL && currentUser) {
+            try {
+                await currentUser.reload();
+                authPhotoURL = currentUser.photoURL || null;
+                authDisplayName = currentUser.displayName || null;
+            } catch (reloadError) {
+                // Reload failed, continue with what we have
+            }
+        }
+        
+        // Prepare profile data with explicit null values (not undefined)
         const profile = {
             fullName: pendingData.fullName || null,
             district: pendingData.district || null,
             phone: pendingData.phone || null,
             profession: pendingData.profession || null,
-            photoURL: authPhotoURL,
-            displayName: authDisplayName,
+            photoURL: authPhotoURL !== undefined ? authPhotoURL : null,
+            displayName: authDisplayName !== undefined ? authDisplayName : null,
         };
         
-        if (qrCodeSnap.exists()) {
-            // Update existing QR code entry with actual uid
-            await update(qrCodeRef, {
+        // Update user and QR code atomically using batch update
+        // This ensures both are updated together, preventing race conditions
+        const qrCodeRef = ref(rtdb, `qrcodes/${qrToken}`);
+        const batchUpdates = {
+            [`users/${uid}`]: {
+                email: normalizedEmail,
+                participantId: pendingData.participantId || null,
+                qrToken: qrToken,
+                qrCodeBase64: pendingData.qrCodeBase64 || null,
+                score: 0,
+                rank: initialRank,
+                profile: profile,
+                firstLoginAt: Date.now(),
+                lastLoginAt: Date.now(),
+            },
+            [`qrcodes/${qrToken}`]: {
                 uid: uid, // Update from encoded email to actual uid
                 name: profile.fullName || profile.displayName || 'User',
-                photo: authPhotoURL,
-                email: normalizedEmail,
-                district: profile.district,
-                phone: profile.phone,
-                profession: profile.profession
-            });
-        } else {
-            // Create QR code entry if it doesn't exist
-            await set(qrCodeRef, {
-                uid: uid,
-                name: profile.fullName || profile.displayName || 'User',
-                photo: authPhotoURL,
-                email: normalizedEmail,
-                district: profile.district,
-                phone: profile.phone,
-                profession: profile.profession
-            });
+                photo: profile.photoURL !== undefined ? profile.photoURL : null, // Explicit null if undefined
+                email: normalizedEmail || null,
+                district: profile.district !== undefined ? profile.district : null,
+                phone: profile.phone !== undefined ? profile.phone : null,
+                profession: profile.profession !== undefined ? profile.profession : null
+            }
+        };
+        
+        // Execute batch update atomically
+        await update(ref(rtdb), batchUpdates);
+        
+        // After user creation, ensure photoURL is synced from Firebase Auth
+        // This handles cases where photoURL wasn't available during migration (e.g., OAuth in incognito)
+        // Wait a moment for Firebase Auth to fully load, then sync photoURL if available
+        if (!authPhotoURL && currentUser) {
+            // Give Firebase Auth more time to load profile data
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            // Try reloading user to get fresh profile data
+            try {
+                await currentUser.reload();
+                if (currentUser.photoURL) {
+                    authPhotoURL = currentUser.photoURL;
+                    // Update RTDB with photoURL from Firebase Auth
+                    const currentProfile = profile;
+                    await update(ref(rtdb, `users/${uid}`), {
+                        profile: {
+                            ...currentProfile,
+                            photoURL: authPhotoURL
+                        }
+                    });
+                    // Also update QR code with photo
+                    if (qrToken) {
+                        await update(ref(rtdb, `qrcodes/${qrToken}`), {
+                            photo: authPhotoURL
+                        });
+                    }
+                }
+            } catch (reloadError) {
+                // Reload failed, continue - Cloud Function will sync it later
+            }
+        }
+        
+        // Clean up all scan records for new user (first login)
+        // This ensures deleted users who are re-added can scan everyone again
+        // We clean up scan records to prevent orphaned records from blocking scans
+        try {
+            // 1. Clear RTDB connection history (recent scans)
+            await set(ref(rtdb, `scans/recent/${uid}`), []);
+            
+            // 2. Clear all scan records where this user was the scanner
+            // This removes any orphaned records from previous account (if same UID)
+            // or ensures clean state for new account
+            await set(ref(rtdb, `scans/byScanner/${uid}`), null);
+            
+            // 3. Clear localStorage cache for connection history
+            try {
+                localStorage.removeItem(`user_${uid}_recentConnections`);
+            } catch (localError) {
+                // localStorage might be disabled, ignore
+            }
+        } catch (historyError) {
+            // Non-critical - continue even if history clearing fails
         }
         
         // RTDB triggers will automatically:
@@ -1692,12 +1789,37 @@ async function processScan(qrToken) {
         
         const targetUid = targetData.uid;
         
+        // Validate targetUid format (should be a valid uid, not encoded email)
+        // If it's an encoded email (contains underscores), it means user hasn't migrated yet
+        if (targetUid.includes('_') && targetUid.length > 20) {
+            // This is likely an encoded email - user hasn't logged in yet
+            throw new Error('User has not completed registration yet');
+        }
+        
         // Step 2: Check if scanning self
         if (targetUid === scannerUid) {
             throw new Error("You can't scan your own QR code!");
         }
         
-        // Step 3: Check duplicate from RTDB (1 read)
+        // Step 3: Verify target user exists in users collection
+        // This handles race conditions where QR code is updated but user migration isn't complete
+        const targetUserRef = ref(rtdb, `users/${targetUid}`);
+        const targetUserSnap = await get(targetUserRef);
+        
+        if (!targetUserSnap.exists()) {
+            // User might be in pending state - check if uid is actually an encoded email
+            const encodedEmail = targetUid;
+            const pendingUserRef = ref(rtdb, `pendingUsers/${encodedEmail}`);
+            const pendingUserSnap = await get(pendingUserRef);
+            
+            if (pendingUserSnap.exists()) {
+                throw new Error('User has not completed registration yet');
+            } else {
+                throw new Error('Target user not found');
+            }
+        }
+        
+        // Step 4: Check duplicate from RTDB (1 read)
         const scanCheckRef = ref(rtdb, `scans/byScanner/${scannerUid}/${targetUid}`);
         const scanCheck = await get(scanCheckRef);
         
@@ -1705,7 +1827,7 @@ async function processScan(qrToken) {
             throw new Error('ALREADY_SCANNED');
         }
         
-        // Step 4: Get current user data from RTDB
+        // Step 5: Get current user data from RTDB
         const scannerUserRef = ref(rtdb, `users/${scannerUid}`);
         const scannerUserSnap = await get(scannerUserRef);
         
@@ -1720,7 +1842,7 @@ async function processScan(qrToken) {
         const scanTimestamp = Date.now();
         const batchId = getCurrentBatchId();
         
-        // Step 5: Record scan in RTDB using transaction for atomicity
+        // Step 6: Record scan in RTDB using transaction for atomicity
         // Ensure all metadata fields are null (not undefined) - RTDB doesn't allow undefined
         const updates = {
             [`scans/byScanner/${scannerUid}/${targetUid}`]: {
@@ -1746,7 +1868,7 @@ async function processScan(qrToken) {
         // Client SDK uses update(ref(rtdb), updates) not rtdb.ref().update()
         await update(ref(rtdb), updates);
         
-        // Step 6: Update recent scans cache (optimistic)
+        // Step 7: Update recent scans cache (optimistic)
         // Ensure targetData has all required fields with null fallbacks
         const safeTargetData = {
             name: targetData.name || null,
@@ -1758,7 +1880,7 @@ async function processScan(qrToken) {
         };
         await updateRecentScansCache(scannerUid, targetUid, safeTargetData);
         
-        // Step 7: Update localStorage cache
+        // Step 8: Update localStorage cache
         updateLocalStorageAfterScan(scannerUid, newScore, newRank, {
             uid: targetUid,
             name: safeTargetData.name,
@@ -1798,10 +1920,12 @@ async function processScan(qrToken) {
             showToast('error', 'Permission denied: ' + (error.message || 'Check RTDB rules'), 'error');
         } else if (error.message.includes("can't scan your own")) {
             showToast('error', "Can't scan your own QR code", 'error');
-        } else if (error.message === 'Invalid QR code') {
+        } else if (error.message === 'Invalid QR code' || error.message === 'Invalid QR code data') {
             showToast('error', 'Invalid QR code', 'error');
-        } else if (error.message === 'User not found') {
+        } else if (error.message === 'User not found' || error.message === 'Target user not found') {
             showToast('error', 'User not found', 'error');
+        } else if (error.message.includes('not completed registration')) {
+            showToast('error', 'User has not completed registration yet', 'error');
         } else {
             showToast('error', 'Scan failed: ' + (error.message || error.code || 'Unknown error'), 'error');
         }
@@ -2422,13 +2546,22 @@ async function loadHistory() {
     if (!currentUser) return;
     
     try {
-        // Read from RTDB scans/recent
+        // Read from RTDB scans/recent (always prioritize RTDB - single source of truth)
         const recentRef = ref(rtdb, `scans/recent/${currentUser.uid}`);
         const recentSnap = await get(recentRef);
         
         let connections = [];
         if (recentSnap.exists()) {
             const recent = recentSnap.val() || [];
+            // If RTDB has empty array, ensure localStorage is also cleared
+            if (Array.isArray(recent) && recent.length === 0) {
+                try {
+                    localStorage.removeItem(`user_${currentUser.uid}_recentConnections`);
+                } catch (localError) {
+                    // localStorage might be disabled, ignore
+                }
+            }
+            
             // Convert to connection format and sort by timestamp (newest first)
             connections = recent
                 .map(conn => ({
