@@ -40,9 +40,16 @@ import {
 import { 
     getDatabase, 
     ref, 
-    get
+    get, 
+    set,
+    update,
+    remove
 } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js';
 import { deleteDoc } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js';
+import { 
+    getFunctions, 
+    httpsCallable 
+} from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-functions.js';
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth();
@@ -99,9 +106,12 @@ onAuthStateChanged(auth, async (user) => {
         }
         
         currentUser = user;
+        
+        // Update user data immediately - photoURL and displayName from Firebase Auth
+        // RTDB triggers will automatically update admin cache in real-time
         await updateUserOnLogin(user);
         
-        // Update localStorage cache (RTDB updates handled by Cloud Functions)
+        // Update localStorage cache
         await updateRTDBUserData(user);
         
         await loadUserProfile();
@@ -152,14 +162,35 @@ function generateQRToken() {
     return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
+// Encode email for RTDB path (replaces invalid characters)
+function encodeEmailForPath(email) {
+    if (!email) return null;
+    // RTDB paths can't contain: . # $ [ ] @
+    // Use base64 encoding and replace invalid chars
+    const base64 = btoa(email.toLowerCase().trim());
+    return base64.replace(/[/+=]/g, (m) => {
+        const map = {'/': '_', '+': '-', '=': ''};
+        return map[m] || '';
+    });
+}
+
 // Check if user is a registered participant and migrate from pendingUsers if needed
+// RTDB-first: Check RTDB first, then Firestore as fallback
 async function checkIfParticipant(uid, email) {
     try {
         if (!email) {
             return false;
         }
         
-        // First check if user already exists in users collection
+        // First check if user already exists in RTDB users
+        const userRTDBRef = ref(rtdb, `users/${uid}`);
+        const userRTDBSnap = await get(userRTDBRef);
+        
+        if (userRTDBSnap.exists()) {
+            return true;
+        }
+        
+        // Also check Firestore users (for backward compatibility)
         const userRef = doc(db, 'users', uid);
         const userSnap = await getDoc(userRef);
         
@@ -167,8 +198,36 @@ async function checkIfParticipant(uid, email) {
             return true;
         }
         
-        // Check pendingUsers using query approach (more reliable with rules)
+        // Check RTDB pendingUsers first (RTDB-first architecture)
         const normalizedEmail = email.toLowerCase().trim();
+        const encodedEmail = encodeEmailForPath(normalizedEmail);
+        
+        // Check RTDB index first
+        const emailIndexRef = ref(rtdb, `indexes/emails/${encodedEmail}`);
+        const emailIndexSnap = await get(emailIndexRef);
+        
+        if (emailIndexSnap.exists()) {
+            const indexData = emailIndexSnap.val();
+            const pendingEmail = indexData.uid || encodedEmail;
+            
+            // Get pending user data from RTDB
+            const pendingUserRTDBRef = ref(rtdb, `pendingUsers/${pendingEmail}`);
+            const pendingUserRTDBSnap = await get(pendingUserRTDBRef);
+            
+            if (pendingUserRTDBSnap.exists()) {
+                const pendingData = pendingUserRTDBSnap.val();
+                
+                // Verify email matches (security check)
+                if (pendingData.email && pendingData.email.toLowerCase().trim() !== normalizedEmail) {
+                    return false;
+                }
+                
+                await migratePendingUser(uid, normalizedEmail, pendingData);
+                return true;
+            }
+        }
+        
+        // Fallback: Check Firestore pendingUsers (for backward compatibility)
         const pendingUsersRef = collection(db, 'pendingUsers');
         const emailQuery = query(pendingUsersRef, where('email', '==', normalizedEmail));
         let querySnapshot;
@@ -186,7 +245,7 @@ async function checkIfParticipant(uid, email) {
                     return true;
                 }
             } catch (fallbackError) {
-                throw error; // Throw original error
+                // Ignore fallback errors
             }
             return false;
         }
@@ -208,7 +267,6 @@ async function checkIfParticipant(uid, email) {
         return false;
     } catch (error) {
         if (error.code === 'permission-denied') {
-            console.error('Permission denied - check Firestore security rules');
         }
         return false;
     }
@@ -227,7 +285,7 @@ async function migratePendingUser(uid, normalizedEmail, pendingData) {
         // Calculate initial rank
         const initialRank = await calculateRank(0);
         
-        // Create user document with all fields
+        // Create user document with all fields (Firestore - backup)
         await setDoc(userRef, {
             email: normalizedEmail,
             participantId: pendingData.participantId || null,
@@ -245,19 +303,222 @@ async function migratePendingUser(uid, normalizedEmail, pendingData) {
             firstLoginAt: serverTimestamp()
         });
         
-        // Note: RTDB updates are handled by Cloud Functions automatically
-        // when Firestore user documents are created
+        // Also update RTDB immediately (RTDB-first architecture)
+        const encodedEmail = encodeEmailForPath(normalizedEmail);
+        const userRTDBRef = ref(rtdb, `users/${uid}`);
         
-        // Delete from pendingUsers
+        // Get photoURL and displayName from currentUser immediately (from Firebase Auth)
+        // This ensures photos are available instantly on first login
+        const authPhotoURL = currentUser && currentUser.photoURL ? currentUser.photoURL : null;
+        const authDisplayName = currentUser && currentUser.displayName ? currentUser.displayName : null;
+        
+        await set(userRTDBRef, {
+            email: normalizedEmail,
+            participantId: pendingData.participantId || null,
+            qrToken: qrToken,
+            qrCodeBase64: pendingData.qrCodeBase64 || null,
+            score: 0,
+            rank: initialRank,
+            profile: {
+                fullName: pendingData.fullName || null,
+                district: pendingData.district || null,
+                phone: pendingData.phone || null,
+                profession: pendingData.profession || null,
+                photoURL: authPhotoURL, // Immediately sync from Firebase Auth
+                displayName: authDisplayName, // Immediately sync from Firebase Auth
+            },
+            firstLoginAt: Date.now(),
+            lastLoginAt: Date.now(),
+        });
+        
+        // Update QR code entry in RTDB to use actual uid instead of encoded email
+        // This is critical for scanning to work correctly
+        const qrCodeRef = ref(rtdb, `qrcodes/${qrToken}`);
+        const qrCodeSnap = await get(qrCodeRef);
+        const profile = {
+            fullName: pendingData.fullName || null,
+            district: pendingData.district || null,
+            phone: pendingData.phone || null,
+            profession: pendingData.profession || null,
+            photoURL: authPhotoURL,
+            displayName: authDisplayName,
+        };
+        
+        if (qrCodeSnap.exists()) {
+            // Update existing QR code entry with actual uid
+            await update(qrCodeRef, {
+                uid: uid, // Update from encoded email to actual uid
+                name: profile.fullName || profile.displayName || 'User',
+                photo: authPhotoURL,
+                email: normalizedEmail,
+                district: profile.district,
+                phone: profile.phone,
+                profession: profile.profession
+            });
+        } else {
+            // Create QR code entry if it doesn't exist
+            await set(qrCodeRef, {
+                uid: uid,
+                name: profile.fullName || profile.displayName || 'User',
+                photo: authPhotoURL,
+                email: normalizedEmail,
+                district: profile.district,
+                phone: profile.phone,
+                profession: profile.profession
+            });
+        }
+        
+        // RTDB triggers will automatically:
+        // 1. Update admin cache (pending -> active) in real-time
+        // 2. Update sorted score index
+        // 3. Calculate and store rank
+        // 4. Update leaderboard if user is in top 10
+        
+        // Set initial rank in ranks cache (so it shows up immediately)
+        // For new users, we'll calculate rank from all existing users
+        let estimatedRank = null;
+        try {
+            // Try to get from sorted index first
+            const indexRef = ref(rtdb, 'indexes/sortedScores');
+            const indexSnap = await get(indexRef);
+            if (indexSnap.exists()) {
+                const sortedIndex = indexSnap.val() || [];
+                // Find where this user would be inserted (score = 0)
+                // Users with score 0 should be at the end
+                estimatedRank = sortedIndex.length + 1;
+            } else {
+                // If index doesn't exist, count all users
+                const usersRef = ref(rtdb, 'users');
+                const usersSnap = await get(usersRef);
+                if (usersSnap.exists()) {
+                    const users = usersSnap.val();
+                    const userCount = Object.keys(users).length;
+                    estimatedRank = userCount; // This user is the last one
+                }
+            }
+        } catch (error) {
+            // Index might not exist yet, that's okay
+        }
+        
+        const rankRef = ref(rtdb, `ranks/${uid}`);
+        await set(rankRef, {
+            leaderboardRank: estimatedRank, // Estimated rank, will be recalculated by Cloud Functions
+            rank: initialRank,
+            lastUpdated: Date.now(),
+        });
+        
+        // Also add user to sorted index immediately (so rank calculation works)
+        // This will be properly sorted by the next batch process, but at least it's in the index
+        try {
+            const indexRef = ref(rtdb, 'indexes/sortedScores');
+            const indexSnap = await get(indexRef);
+            let sortedIndex = indexSnap.exists() ? indexSnap.val() : [];
+            
+            // Add new user to index (at the end since score is 0)
+            sortedIndex.push({
+                uid: uid,
+                score: 0,
+                firstLoginAt: Date.now(),
+            });
+            
+            // Sort by score (desc), then firstLoginAt (asc)
+            sortedIndex.sort((a, b) => {
+                if (b.score !== a.score) return b.score - a.score;
+                return a.firstLoginAt - b.firstLoginAt;
+            });
+            
+            // Limit to top 1000
+            const limitedIndex = sortedIndex.slice(0, 1000);
+            await set(indexRef, limitedIndex);
+        } catch (error) {
+            // Index update failed, Cloud Functions will fix it
+        }
+        
+        // Update RTDB indexes
+        const indexUpdates = {};
+        if (normalizedEmail) {
+            indexUpdates[`indexes/emails/${encodedEmail}`] = {
+                uid: uid,
+                email: normalizedEmail,
+                type: 'active',
+                lastUpdated: Date.now(),
+            };
+        }
+        if (pendingData.participantId) {
+            indexUpdates[`indexes/participantIds/${pendingData.participantId}`] = {
+                uid: uid,
+                email: normalizedEmail,
+                type: 'active',
+                lastUpdated: Date.now(),
+            };
+        }
+        if (qrToken) {
+            indexUpdates[`indexes/qrTokens/${qrToken}`] = {
+                uid: uid,
+                email: normalizedEmail,
+                lastUpdated: Date.now(),
+            };
+        }
+        
+        if (Object.keys(indexUpdates).length > 0) {
+            await update(ref(rtdb), indexUpdates);
+        }
+        
+        // Remove from RTDB pendingUsers
+        // RTDB triggers will automatically update admin cache
+        const pendingUserRTDBRef = ref(rtdb, `pendingUsers/${encodedEmail}`);
+        await remove(pendingUserRTDBRef);
+        
+        // Also remove from Firestore pendingUsers (for backward compatibility)
         try {
             const pendingUserRef = doc(db, 'pendingUsers', normalizedEmail);
             await deleteDoc(pendingUserRef);
         } catch (deleteError) {
             // Non-critical - user is migrated, pendingUsers entry can be cleaned up later
         }
+        
+        // Note: Admin cache and ranks are automatically updated by RTDB triggers
+        // No need for manual cache updates - triggers handle it in real-time
     } catch (error) {
-        console.error('Error during migration:', error);
         throw error;
+    }
+}
+
+// Sync photoURL from admin cache to user cache if user cache is missing it
+async function syncPhotoURLFromAdminCache(uid) {
+    try {
+        // Check if user cache has photoURL
+        const userRTDBRef = ref(rtdb, `users/${uid}`);
+        const userRTDBSnap = await get(userRTDBRef);
+        
+        if (userRTDBSnap.exists()) {
+            const userData = userRTDBSnap.val();
+            const profile = userData.profile || {};
+            const hasPhotoURL = profile.photoURL || userData.photoURL;
+            
+            // If user cache doesn't have photoURL, check admin cache
+            if (!hasPhotoURL) {
+                const adminCacheRef = ref(rtdb, 'adminCache/participants');
+                const adminCacheSnap = await get(adminCacheRef);
+                
+                if (adminCacheSnap.exists()) {
+                    const cache = adminCacheSnap.val();
+                    const activeUsers = cache.active || [];
+                    const userInCache = activeUsers.find(p => p.id === uid);
+                    
+                    if (userInCache && userInCache.photoURL) {
+                        // Found photoURL in admin cache, sync to user cache
+                        const profileUpdate = {...profile};
+                        profileUpdate.photoURL = userInCache.photoURL;
+                        await update(ref(rtdb, `users/${uid}`), {
+                            profile: profileUpdate
+                        });
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        // Non-critical, continue
     }
 }
 
@@ -267,34 +528,95 @@ async function updateUserOnLogin(user) {
         const userRef = doc(db, 'users', user.uid);
         const userSnap = await getDoc(userRef);
         
-        if (!userSnap.exists()) {
-            throw new Error('User not found. UID: ' + user.uid);
+        // Check if user exists in Firestore
+        if (userSnap.exists()) {
+            const userData = userSnap.data();
+            const updateData = {};
+            
+            // Always update displayName and photoURL if available from auth
+            if (user.displayName) {
+                updateData.displayName = user.displayName;
+            }
+            if (user.photoURL) {
+                updateData.photoURL = user.photoURL;
+            }
+            
+            // Set firstLoginAt if not exists, otherwise update lastLoginAt
+            if (!userData.firstLoginAt) {
+                updateData.firstLoginAt = serverTimestamp();
+            } else {
+                updateData.lastLoginAt = serverTimestamp();
+            }
+            
+            if (Object.keys(updateData).length > 0) {
+                await updateDoc(userRef, updateData);
+            }
         }
+        // If user doesn't exist in Firestore, they might be admin-only
+        // Still update RTDB if they exist there (admin users can also be participants)
         
-        const userData = userSnap.data();
-        const updateData = {};
-        
-        // Always update displayName and photoURL if available from auth
-        if (user.displayName) {
-            updateData.displayName = user.displayName;
-        }
-        if (user.photoURL) {
-            updateData.photoURL = user.photoURL;
-        }
-        
-        // Set firstLoginAt if not exists, otherwise update lastLoginAt
-        if (!userData.firstLoginAt) {
-            updateData.firstLoginAt = serverTimestamp();
-        } else {
-            updateData.lastLoginAt = serverTimestamp();
-        }
-        
-        if (Object.keys(updateData).length > 0) {
-            await updateDoc(userRef, updateData);
+        // Always update RTDB immediately if user exists (for both regular and admin users)
+        // RTDB triggers will automatically update admin cache in real-time
+        if (user.displayName || user.photoURL) {
+            try {
+                const userRTDBRef = ref(rtdb, `users/${user.uid}`);
+                const userRTDBSnap = await get(userRTDBRef);
+                
+                if (userRTDBSnap.exists()) {
+                    const userRTDBData = userRTDBSnap.val();
+                    const currentProfile = userRTDBData.profile || {};
+                    
+                    // Always update photoURL and displayName from Firebase Auth
+                    // This ensures photos are available immediately
+                    const profileUpdate = {
+                        ...currentProfile,
+                        // Override with auth data if available (always freshest)
+                        photoURL: user.photoURL || currentProfile.photoURL || null,
+                        displayName: user.displayName || currentProfile.displayName || null,
+                    };
+                    
+                    await update(ref(rtdb, `users/${user.uid}`), {
+                        profile: profileUpdate,
+                        lastLoginAt: Date.now(),
+                    });
+                }
+                // If user doesn't exist in RTDB, they're not a participant yet
+                // Don't create them here - they need to be added as a participant first
+            } catch (rtdbError) {
+                // RTDB update failed, continue
+            }
         }
     } catch (error) {
         if (error.code === 'permission-denied') {
-            console.error('Permission denied - check Firestore rules');
+            // Permission denied - might be admin user not in users collection
+            // Still try to update RTDB if they exist there
+            if (user.displayName || user.photoURL) {
+                try {
+                    const userRTDBRef = ref(rtdb, `users/${user.uid}`);
+                    const userRTDBSnap = await get(userRTDBRef);
+                    
+                    if (userRTDBSnap.exists()) {
+                        const userRTDBData = userRTDBSnap.val();
+                        const currentProfile = userRTDBData.profile || {};
+                        
+                        const profileUpdate = {
+                            ...currentProfile
+                        };
+                        if (user.displayName) {
+                            profileUpdate.displayName = user.displayName;
+                        }
+                        if (user.photoURL) {
+                            profileUpdate.photoURL = user.photoURL;
+                        }
+                        
+                        await update(ref(rtdb, `users/${user.uid}`), {
+                            profile: profileUpdate
+                        });
+                    }
+                } catch (rtdbError) {
+                    // RTDB update also failed, continue
+                }
+            }
         }
     }
 }
@@ -304,6 +626,57 @@ let ranksCache = null;
 let ranksCacheTime = 0;
 const RANKS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const RANKS_DOC_PATH = 'appConfig/ranks';
+
+// Helper: Get current batch ID (5-minute intervals)
+function getCurrentBatchId() {
+    const now = new Date();
+    const minutes = Math.floor(now.getMinutes() / 5) * 5;
+    const batchDate = new Date(now.getFullYear(), now.getMonth(), 
+                               now.getDate(), now.getHours(), minutes);
+    return batchDate.toISOString().slice(0, 16).replace('T', '-');
+}
+
+// Helper: Calculate rank from RTDB ranges
+async function calculateRankFromRTDB(score) {
+    try {
+        const rangesRef = ref(rtdb, 'ranks/ranges');
+        const rangesSnap = await get(rangesRef);
+        
+        if (rangesSnap.exists()) {
+            const ranges = rangesSnap.val();
+            if (score >= 200) return ranges['200+']?.rank || 'Super Star';
+            if (score >= 51) return ranges['51-199']?.rank || 'Connector';
+            return ranges['0-50']?.rank || 'Rookie';
+        }
+    } catch (error) {
+        // Fallback to default calculation
+    }
+    
+    // Fallback to default ranks
+    return calculateRank(score);
+}
+
+// Helper: Update recent scans cache in RTDB
+async function updateRecentScansCache(scannerUid, scannedUid, qrData) {
+    try {
+        const recentRef = ref(rtdb, `scans/recent/${scannerUid}`);
+        const recentSnap = await get(recentRef);
+        const recent = recentSnap.val() || [];
+        
+        recent.unshift({
+            scannedUid: scannedUid,
+            name: qrData.name,
+            photo: qrData.photo,
+            district: qrData.district,
+            scannedAt: Date.now()
+        });
+        
+        // Keep only last 10
+        await set(recentRef, recent.slice(0, 10));
+    } catch (error) {
+        // Non-critical, ignore
+    }
+}
 
 // Calculate rank based on score (dynamic from Firestore)
 async function calculateRank(score) {
@@ -337,7 +710,6 @@ async function calculateRank(score) {
         
         return findRankForScore(score, ranks);
     } catch (error) {
-        console.error('Error calculating rank:', error);
         // Fallback to default ranks on error
         return getDefaultRank(score);
     }
@@ -448,45 +820,101 @@ function getDefaultRank(score) {
     }
 }
 
-// Load user profile (using localStorage for current user's data)
+// Cache TTL constants (in milliseconds)
+const CACHE_TTL = {
+    PROFILE: 5 * 60 * 1000,      // 5 minutes
+    QR_CODE: 30 * 60 * 1000,     // 30 minutes (QR codes rarely change)
+    LEADERBOARD: 2 * 60 * 1000,  // 2 minutes
+    RECENT_CONNECTIONS: 3 * 60 * 1000, // 3 minutes
+};
+
+// Load user profile (RTDB-first with expanded caching)
 async function loadUserProfile() {
     if (!currentUser) return;
     
     try {
-        // Try to get score/rank from localStorage first (instant, no network)
-        let score = null;
-        let rank = null;
+        // Try to get full profile from localStorage cache first
+        let cachedProfile = null;
+        let cachedQRCode = null;
         
         try {
             const cachedData = localStorage.getItem(`user_${currentUser.uid}_data`);
+            const cachedQR = localStorage.getItem(`user_${currentUser.uid}_qr`);
+            
             if (cachedData) {
                 const parsed = JSON.parse(cachedData);
                 // Check if cache is recent (less than 5 minutes old)
-                if (parsed.timestamp && (Date.now() - parsed.timestamp) < 5 * 60 * 1000) {
-                    score = parsed.score;
-                    rank = parsed.rank;
+                if (parsed.timestamp && (Date.now() - parsed.timestamp) < CACHE_TTL.PROFILE) {
+                    cachedProfile = parsed;
+                }
+            }
+            
+            if (cachedQR) {
+                const parsed = JSON.parse(cachedQR);
+                // Check if QR cache is recent (less than 30 minutes old)
+                if (parsed.timestamp && (Date.now() - parsed.timestamp) < CACHE_TTL.QR_CODE) {
+                    cachedQRCode = parsed.qrCodeBase64;
                 }
             }
         } catch (localError) {
-            // localStorage might be disabled, continue to Firestore
+            // localStorage might be disabled, continue to RTDB
         }
         
-        // Get user data using UID as document ID
-        const userRef = doc(db, 'users', currentUser.uid);
-        const userSnap = await getDoc(userRef);
+        // If we have cached profile data, use it for immediate UI update
+        if (cachedProfile) {
+            document.getElementById('user-name').textContent = cachedProfile.fullName || cachedProfile.displayName || 'User';
+            document.getElementById('user-email').textContent = cachedProfile.district ? `RI District ${cachedProfile.district}` : 'N/A';
+            document.getElementById('user-score').textContent = cachedProfile.score || 0;
+            document.getElementById('user-rank').textContent = cachedProfile.rank || 'Rookie';
+            
+            // Set avatar from cache
+            if (cachedProfile.photoURL) {
+                const avatarImg = document.getElementById('user-avatar');
+                const qrAvatarOverlay = document.getElementById('qr-avatar-overlay');
+                if (avatarImg) {
+                    avatarImg.src = cachedProfile.photoURL;
+                    avatarImg.style.display = 'block';
+                }
+                if (qrAvatarOverlay) {
+                    qrAvatarOverlay.src = cachedProfile.photoURL;
+                    qrAvatarOverlay.style.display = 'block';
+                }
+            }
+            
+            // Display cached QR code if available
+            if (cachedQRCode) {
+                displayQRCodeFromDatabase(cachedQRCode);
+            }
+        }
+        
+        // Get user data from RTDB (primary source) - always fetch for freshness
+        const userRef = ref(rtdb, `users/${currentUser.uid}`);
+        const userSnap = await get(userRef);
         
         if (userSnap.exists()) {
-            const userData = userSnap.data();
+            const userData = userSnap.val();
             
-            // Use cached score/rank if available, otherwise use Firestore data
-            const finalScore = score !== null ? score : (userData.score || 0);
-            const finalRank = rank || userData.rank || await calculateRank(finalScore);
+            // Always use RTDB data as source of truth (RTDB is always fresh)
+            // RTDB is the authoritative source - only use cache if RTDB data is completely missing
+            // Ensure score is always a number
+            const rtdbScore = (userData.score !== null && userData.score !== undefined) 
+                ? Number(userData.score) 
+                : null;
+            const finalScore = rtdbScore !== null ? rtdbScore : (cachedProfile?.score ?? 0);
+            const finalRank = userData.rank || cachedProfile?.rank || await calculateRankFromRTDB(finalScore);
             
-            // Update localStorage cache (instant, no network cost)
+            // Update localStorage cache with full profile (instant, no network cost)
             try {
+                const profile = userData.profile || {};
+                const photoURL = profile.photoURL || userData.photoURL || (currentUser && currentUser.photoURL) || null;
+                
                 localStorage.setItem(`user_${currentUser.uid}_data`, JSON.stringify({
                     score: finalScore,
                     rank: finalRank,
+                    fullName: profile.fullName || userData.fullName,
+                    displayName: profile.displayName || userData.displayName,
+                    district: profile.district || userData.district,
+                    photoURL: photoURL,
                     timestamp: Date.now()
                 }));
             } catch (localError) {
@@ -494,8 +922,52 @@ async function loadUserProfile() {
             }
             
             // Update UI
-            document.getElementById('user-name').textContent = userData.fullName || userData.displayName || 'User';
-            document.getElementById('user-email').textContent = userData.district ? `RI District ${userData.district}` : 'N/A';
+            const profile = userData.profile || {};
+            // Handle backward compatibility: check both profile.photoURL and root-level photoURL
+            // Also check currentUser.photoURL from Firebase Auth
+            let photoURL = profile.photoURL || userData.photoURL || null;
+            
+            // If no photoURL in RTDB, try multiple sources:
+            // 1. Firebase Auth
+            // 2. Admin cache (if available)
+            if (!photoURL) {
+                // Try Firebase Auth first
+                if (currentUser && currentUser.photoURL) {
+                    photoURL = currentUser.photoURL;
+                } else {
+                    // Try admin cache as fallback
+                    try {
+                        const adminCacheRef = ref(rtdb, 'adminCache/participants');
+                        const adminCacheSnap = await get(adminCacheRef);
+                        if (adminCacheSnap.exists()) {
+                            const cache = adminCacheSnap.val();
+                            const activeUsers = cache.active || [];
+                            const userInCache = activeUsers.find(p => p.id === currentUser.uid);
+                            if (userInCache && userInCache.photoURL) {
+                                photoURL = userInCache.photoURL;
+                            }
+                        }
+                    } catch (cacheError) {
+                        // Admin cache read failed, continue
+                    }
+                }
+                
+                // If we found a photoURL from any source, update RTDB
+                if (photoURL) {
+                    try {
+                        const profileUpdate = {...profile};
+                        profileUpdate.photoURL = photoURL;
+                        await update(ref(rtdb, `users/${currentUser.uid}`), {
+                            profile: profileUpdate
+                        });
+                    } catch (updateError) {
+                        // Non-critical, continue
+                    }
+                }
+            }
+            
+            document.getElementById('user-name').textContent = profile.fullName || profile.displayName || userData.fullName || userData.displayName || 'User';
+            document.getElementById('user-email').textContent = (profile.district || userData.district) ? `RI District ${profile.district || userData.district}` : 'N/A';
             document.getElementById('user-score').textContent = finalScore;
             document.getElementById('user-rank').textContent = finalRank;
             
@@ -503,14 +975,14 @@ async function loadUserProfile() {
             const avatarImg = document.getElementById('user-avatar');
             const qrAvatarOverlay = document.getElementById('qr-avatar-overlay');
             
-            const photoURL = userData.photoURL || (currentUser && currentUser.photoURL) || null;
-            
             if (photoURL) {
+                if (avatarImg) {
                 avatarImg.src = photoURL;
                 avatarImg.style.display = 'block';
                 avatarImg.onerror = function() {
                     avatarImg.style.display = 'none';
                 };
+                }
                 if (qrAvatarOverlay) {
                     qrAvatarOverlay.src = photoURL;
                     qrAvatarOverlay.style.display = 'block';
@@ -519,20 +991,73 @@ async function loadUserProfile() {
                     };
                 }
             } else {
+                if (avatarImg) {
                 avatarImg.style.display = 'none';
+                }
                 if (qrAvatarOverlay) {
                     qrAvatarOverlay.style.display = 'none';
                 }
             }
             
-            // Display QR code from database
-            displayQRCodeFromDatabase(userData.qrCodeBase64);
+            // Display QR code - use cache if available, otherwise read from RTDB
+            let qrCodeBase64 = cachedQRCode || userData.qrCodeBase64 || null;
+            
+            // If not in cache or RTDB, try Firestore as fallback
+            if (!qrCodeBase64 && userData.qrToken) {
+                try {
+                    const userDocRef = doc(db, 'users', currentUser.uid);
+                    const userDocSnap = await getDoc(userDocRef);
+                    if (userDocSnap.exists()) {
+                        const firestoreData = userDocSnap.data();
+                        qrCodeBase64 = firestoreData.qrCodeBase64 || null;
+                        
+                        // If found in Firestore, update RTDB and cache for future use
+                        if (qrCodeBase64) {
+                            await update(ref(rtdb, `users/${currentUser.uid}`), {
+                                qrCodeBase64: qrCodeBase64
+                            });
+                            // Cache QR code
+                            try {
+                                localStorage.setItem(`user_${currentUser.uid}_qr`, JSON.stringify({
+                                    qrCodeBase64: qrCodeBase64,
+                                    timestamp: Date.now()
+                                }));
+                            } catch (localError) {
+                                // localStorage might be disabled, ignore
+                            }
+                        }
+                    }
+                } catch (error) {
+                    // Firestore fallback failed, continue
+                }
+            }
+            
+            // Display QR code
+            if (qrCodeBase64) {
+                displayQRCodeFromDatabase(qrCodeBase64);
+                // Cache QR code if not already cached
+                if (!cachedQRCode) {
+                    try {
+                        localStorage.setItem(`user_${currentUser.uid}_qr`, JSON.stringify({
+                            qrCodeBase64: qrCodeBase64,
+                            timestamp: Date.now()
+                        }));
+                    } catch (localError) {
+                        // localStorage might be disabled, ignore
+                    }
+                }
+            } else if (userData.qrToken) {
+                // Fallback: try to generate using the fallback function
+                const canvas = document.getElementById('qr-code-canvas');
+                if (canvas) {
+                    generateQRCodeFallback(userData.qrToken, canvas);
+                }
+            }
             
             // Load recent connections
             await loadRecentConnections();
         }
     } catch (error) {
-        console.error('Error loading user profile:', error);
         // Only show alert for critical errors, not for non-critical operations
         if (error.code === 'permission-denied') {
             // Don't show alert - profile might still load from cache or other sources
@@ -544,7 +1069,6 @@ async function loadUserProfile() {
 function displayQRCodeFromDatabase(qrCodeBase64) {
     const canvas = document.getElementById('qr-code-canvas');
     if (!canvas) {
-        console.error('QR code canvas not found');
         return;
     }
     
@@ -558,7 +1082,6 @@ function displayQRCodeFromDatabase(qrCodeBase64) {
             ctx.drawImage(img, 0, 0, 192, 192);
         };
         img.onerror = async function() {
-            console.error('Error loading QR code image');
             // Fallback: try to generate from qrToken if available
             const userData = currentUser ? await getCurrentUserData() : null;
             if (userData && userData.qrToken) {
@@ -579,15 +1102,14 @@ function displayQRCodeFromDatabase(qrCodeBase64) {
     }
 }
 
-// Helper to get current user data (updated for new architecture)
+// Helper to get current user data (RTDB-first)
 async function getCurrentUserData() {
     if (!currentUser) return null;
     try {
-        const userRef = doc(db, 'users', currentUser.uid);
-        const userSnap = await getDoc(userRef);
-        return userSnap.exists() ? userSnap.data() : null;
+        const userRef = ref(rtdb, `users/${currentUser.uid}`);
+        const userSnap = await get(userRef);
+        return userSnap.exists() ? userSnap.val() : null;
     } catch (error) {
-        console.error('Error getting user data:', error);
         return null;
     }
 }
@@ -611,12 +1133,10 @@ function generateQRCodeFallback(qrToken, canvas) {
                     }
                 }, (error) => {
                     if (error) {
-                        console.error('Error generating QR code:', error);
                         tryAlternativeQRGeneration(qrToken, canvas);
                     }
                 });
             } catch (err) {
-                console.error('Error in QRCode.toCanvas:', err);
                 tryAlternativeQRGeneration(qrToken, canvas);
             }
         } else if (attempts < 25) {
@@ -669,7 +1189,6 @@ function tryAlternativeQRGeneration(qrToken, canvas) {
             }
             return;
         } catch (err) {
-            console.error('Alternative QR generation failed:', err);
         }
     }
     
@@ -688,7 +1207,7 @@ function tryAlternativeQRGeneration(qrToken, canvas) {
     ctx.fillText('Loading...', canvas.width / 2, canvas.height / 2 + 10);
 }
 
-// Load recent connections (using localStorage - we already have scanHistory from user document)
+// Load recent connections (RTDB-first)
 async function loadRecentConnections() {
     if (!currentUser) return;
     
@@ -711,35 +1230,35 @@ async function loadRecentConnections() {
                 }
             }
         } catch (localError) {
-            // localStorage might be disabled or invalid, continue to Firestore
+            // localStorage might be disabled or invalid, continue to RTDB
         }
         
-        // If no cache, get from user document (which we already read in loadUserProfile)
-        // But we'll get it from the userData we already have if available
+        // If no cache, get from RTDB scans/recent
         if (connections.length === 0) {
-        const userRef = doc(db, 'users', currentUser.uid);
-        const userSnap = await getDoc(userRef);
-        
-        if (!userSnap.exists()) return;
-        
-        const userData = userSnap.data();
-        const scanHistory = userData.scanHistory || [];
-        
-        // Sort by timestamp (most recent first)
-            connections = [...scanHistory].sort((a, b) => {
-            const timeA = a.scannedAt ? (typeof a.scannedAt === 'string' ? new Date(a.scannedAt).getTime() : a.scannedAt.toMillis()) : 0;
-            const timeB = b.scannedAt ? (typeof b.scannedAt === 'string' ? new Date(b.scannedAt).getTime() : b.scannedAt.toMillis()) : 0;
-            return timeB - timeA;
-            }).slice(0, 3);
+            const recentRef = ref(rtdb, `scans/recent/${currentUser.uid}`);
+            const recentSnap = await get(recentRef);
             
-            // Update localStorage cache (instant, no network cost)
-            try {
-                localStorage.setItem(`user_${currentUser.uid}_recentConnections`, JSON.stringify({
-                    connections: connections,
-                    timestamp: Date.now()
-                }));
-            } catch (localError) {
-                // localStorage might be disabled, ignore
+            if (recentSnap.exists()) {
+                const recent = recentSnap.val() || [];
+                // Sort by scannedAt (most recent first) and take first 3
+                connections = recent
+                    .sort((a, b) => (b.scannedAt || 0) - (a.scannedAt || 0))
+                    .slice(0, 3)
+                    .map(conn => ({
+                        uid: conn.scannedUid,
+                        name: conn.name,
+                        photo: conn.photo
+                    }));
+                
+                // Update localStorage cache
+                try {
+                    localStorage.setItem(`user_${currentUser.uid}_recentConnections`, JSON.stringify({
+                        connections: connections,
+                        timestamp: Date.now()
+                    }));
+                } catch (localError) {
+                    // localStorage might be disabled, ignore
+                }
             }
         }
         
@@ -763,11 +1282,11 @@ async function loadRecentConnections() {
         // Show "+X more" if there are more connections
         if (connections.length === 3) {
             try {
-                const userRef = doc(db, 'users', currentUser.uid);
-                const userSnap = await getDoc(userRef);
-                if (userSnap.exists()) {
-                    const userData = userSnap.data();
-                    const totalConnections = (userData.scanHistory || []).length;
+                const recentRef = ref(rtdb, `scans/recent/${currentUser.uid}`);
+                const recentSnap = await get(recentRef);
+                if (recentSnap.exists()) {
+                    const recent = recentSnap.val() || [];
+                    const totalConnections = recent.length;
                     if (totalConnections > 3) {
             const more = document.createElement('div');
             more.className = 'h-12 w-12 rounded-full ring-4 ring-background-dark bg-surface-dark flex items-center justify-center border border-white/10 text-xs font-bold text-slate-400';
@@ -780,7 +1299,6 @@ async function loadRecentConnections() {
             }
         }
     } catch (error) {
-        console.error('Error loading recent connections:', error);
         // Don't show alert - this is a non-critical feature
     }
 }
@@ -788,7 +1306,7 @@ async function loadRecentConnections() {
 // Note: Removed RTDB cache functions for current user's data
 // Using localStorage instead since we already read the full user document from Firestore
 
-// Get user's leaderboard rank (position in leaderboard: 1st, 2nd, 3rd, etc.)
+// Get user's leaderboard rank (RTDB-only)
 async function getUserLeaderboardRank(uid) {
     try {
         // Try localStorage first (instant, no network)
@@ -801,7 +1319,7 @@ async function getUserLeaderboardRank(uid) {
             }
         }
 
-        // Try RTDB cache (cheap, 1 read) with retry logic
+        // Read from RTDB (pre-computed)
         const rankRef = ref(rtdb, `ranks/${uid}`);
         let rankSnap;
         let retryCount = 0;
@@ -845,24 +1363,11 @@ async function getUserLeaderboardRank(uid) {
             
             return rank;
         }
-
-        // Fallback: Calculate from Firestore (expensive - reads all users)
-        // This should rarely happen if Cloud Functions are working
-        const allUsersRef = collection(db, 'users');
-        const allUsersQuery = query(allUsersRef, orderBy('score', 'desc'));
-        const allUsersSnap = await getDocs(allUsersQuery);
         
-        let rank = 1;
-        for (const doc of allUsersSnap.docs) {
-            if (doc.id === uid) {
-                return rank;
-            }
-            rank++;
-        }
-        
-        return null; // User not found
+        // If RTDB cache doesn't exist, return null
+        // Cloud Functions should have pre-computed it during migration
+        return null;
     } catch (error) {
-        console.error('Error getting user leaderboard rank:', error);
         return null;
     }
 }
@@ -872,7 +1377,6 @@ document.getElementById('google-signin-btn').addEventListener('click', async () 
     try {
         await signInWithPopup(auth, googleProvider);
     } catch (error) {
-        console.error('Sign-in error:', error);
         alert('Failed to sign in. Please try again.');
     }
 });
@@ -956,7 +1460,6 @@ async function performLogout() {
         await signOut(auth);
         // Auth state change will handle redirect to login
     } catch (error) {
-        console.error('Logout error:', error);
         showToast('error', 'Failed to logout. Please try again.', 'error');
     }
 }
@@ -1100,7 +1603,6 @@ async function startScanner() {
         }, 500);
         scannerActive = true;
     } catch (err) {
-        console.error('Scanner start error:', err);
         scannerActive = false;
         html5QrCode = null;
         alert('Failed to start camera. Please check permissions.');
@@ -1113,7 +1615,6 @@ async function stopScanner() {
             await html5QrCode.stop();
             html5QrCode.clear();
         } catch (err) {
-            console.error('Scanner stop error:', err);
         }
         scannerActive = false;
         html5QrCode = null; // Clear the reference
@@ -1160,7 +1661,7 @@ async function ensureScannerActive() {
 }
 
 /**
- * Process a QR code scan using hybrid architecture (RTDB + Firestore)
+ * Process a QR code scan using RTDB-first architecture
  * @param {string} qrToken - The 32-character hex token from the scanned QR code
  */
 async function processScan(qrToken) {
@@ -1187,77 +1688,63 @@ async function processScan(qrToken) {
             throw new Error("You can't scan your own QR code!");
         }
         
-        // Prepare scan entry data (before transaction to ensure consistency)
-        // Use RTDB cache data which now includes all needed fields
-        const scanEntry = {
-            uid: targetData.uid,
-            name: targetData.name || 'Unknown',
-            photo: targetData.photo || null,
-            email: targetData.email || null,
-            phone: targetData.phone || null,
-            district: targetData.district || null,
-            profession: targetData.profession || null,
-            scannedAt: new Date().toISOString() // Use ISO string for consistency
+        // Step 3: Check duplicate from RTDB (1 read)
+        const scanCheckRef = ref(rtdb, `scans/byScanner/${scannerUid}/${targetUid}`);
+        const scanCheck = await get(scanCheckRef);
+        
+        if (scanCheck.exists()) {
+            throw new Error('ALREADY_SCANNED');
+        }
+        
+        // Step 4: Get current user data from RTDB
+        const scannerUserRef = ref(rtdb, `users/${scannerUid}`);
+        const scannerUserSnap = await get(scannerUserRef);
+        
+        if (!scannerUserSnap.exists()) {
+            throw new Error('User not found');
+        }
+        
+        const userData = scannerUserSnap.val();
+        const currentScore = userData.score || 0;
+        const newScore = currentScore + 10;
+        const newRank = await calculateRankFromRTDB(newScore);
+        const scanTimestamp = Date.now();
+        const batchId = getCurrentBatchId();
+        
+        // Step 5: Record scan in RTDB using transaction for atomicity
+        const updates = {
+            [`scans/byScanner/${scannerUid}/${targetUid}`]: {
+                scannedAt: scanTimestamp,
+                points: 10,
+                metadata: {
+                    name: targetData.name,
+                    photo: targetData.photo,
+                    district: targetData.district
+                }
+            },
+            // Note: scans/pending is write-protected (Cloud Functions only)
+            // The batch process doesn't require it - it processes pendingScores directly
+            [`pendingScores/${batchId}/${scannerUid}`]: {
+                delta: 10,
+                timestamp: scanTimestamp
+            },
+            [`users/${scannerUid}/score`]: newScore,
+            [`users/${scannerUid}/rank`]: newRank
         };
         
-        // Step 3: Transaction to check scanHistory, update score, and add to scanHistory atomically
-        // This ensures NO duplicates can occur even with concurrent scans
-        const scannerUserRef = doc(db, 'users', scannerUid);
+        // Use RTDB batch update to ensure atomicity
+        // Client SDK uses update(ref(rtdb), updates) not rtdb.ref().update()
+        await update(ref(rtdb), updates);
         
-        await runTransaction(db, async (transaction) => {
-            // Read user document within transaction to get latest state
-            const scannerUserDoc = await transaction.get(scannerUserRef);
-            
-            if (!scannerUserDoc.exists()) {
-                throw new Error("Current user document does not exist!");
-            }
-            
-            const userData = scannerUserDoc.data();
-            const scanHistory = userData.scanHistory || [];
-            const currentScore = userData.score || 0;
-            const newScore = currentScore + 10;
-            
-            // CRITICAL: Check if already scanned by looking in scanHistory array
-            // This check MUST be inside the transaction to prevent race conditions
-            // We check by uid (primary check) and also by exact match (defensive check)
-            const alreadyScanned = scanHistory.some(entry => {
-                // Primary check: by uid
-                const entryUid = entry.uid || entry.scannedUid || null;
-                if (entryUid === targetUid) {
-                    return true;
-                }
-                // Defensive check: exact match (in case uid format differs)
-                // Compare all fields except scannedAt (which will always differ)
-                return entry.uid === scanEntry.uid &&
-                       entry.email === scanEntry.email &&
-                       entry.phone === scanEntry.phone;
-            });
-            
-            if (alreadyScanned) {
-                throw new Error('ALREADY_SCANNED');
-            }
-            
-            // Calculate rank (using cache if available, otherwise will use default)
-            // Note: calculateRank is synchronous and uses cached rank data
-            const finalRank = await calculateRank(newScore);
-            
-            // Update user: increment score, add to scanHistory, and update rank ALL ATOMICALLY
-            // This is the critical fix - scanHistory update is now inside the transaction
-            transaction.update(scannerUserRef, {
-                score: increment(10),
-                scanHistory: arrayUnion(scanEntry),
-                rank: finalRank
-            });
+        // Step 6: Update recent scans cache (optimistic)
+        await updateRecentScansCache(scannerUid, targetUid, targetData);
+        
+        // Step 7: Update localStorage cache
+        updateLocalStorageAfterScan(scannerUid, newScore, newRank, {
+            uid: targetUid,
+            name: targetData.name,
+            photo: targetData.photo
         });
-        
-        // Get the updated score for localStorage update
-        const updatedUserDoc = await getDoc(scannerUserRef);
-        const updatedUserData = updatedUserDoc.exists() ? updatedUserDoc.data() : {};
-        const updatedScore = updatedUserData.score || 0;
-        const updatedRank = updatedUserData.rank || 'Rookie';
-        
-        // Update localStorage cache after successful scan (instant, no network)
-        updateLocalStorageAfterScan(scannerUid, updatedScore, updatedRank, scanEntry);
         
         // Show subtle success notification
         showToast('check_circle', 'You earned 10 points!', 'success');
@@ -1287,15 +1774,17 @@ async function processScan(qrToken) {
         // The processing flag and debouncing will prevent duplicate scans
         
         if (error.message === 'ALREADY_SCANNED') {
-            showToast('error', 'Already scanned this person', 'error');
+            showToast('error', 'Already connected with this person', 'error');
         } else if (error.code === 'permission-denied') {
-            showToast('error', 'Permission denied', 'error');
+            showToast('error', 'Permission denied: ' + (error.message || 'Check RTDB rules'), 'error');
         } else if (error.message.includes("can't scan your own")) {
             showToast('error', "Can't scan your own QR code", 'error');
         } else if (error.message === 'Invalid QR code') {
             showToast('error', 'Invalid QR code', 'error');
+        } else if (error.message === 'User not found') {
+            showToast('error', 'User not found', 'error');
         } else {
-            showToast('error', 'Scan failed', 'error');
+            showToast('error', 'Scan failed: ' + (error.message || error.code || 'Unknown error'), 'error');
         }
         
         // Clear the last scanned token after error
@@ -1533,12 +2022,27 @@ window.addEventListener('beforeunload', async () => {
     }
 });
 
-// Load leaderboard (optimized with RTDB cache)
+// Load leaderboard (RTDB-only with caching)
 async function loadLeaderboard() {
     let participants = [];
     
     try {
-        // Try RTDB cache first (cost-effective) with retry logic
+        // Check localStorage cache first
+        let cachedLeaderboard = null;
+        try {
+            const cached = localStorage.getItem('leaderboard_cache');
+            if (cached) {
+                const parsed = JSON.parse(cached);
+                // Check if cache is recent (less than 2 minutes old)
+                if (parsed.timestamp && (Date.now() - parsed.timestamp) < CACHE_TTL.LEADERBOARD) {
+                    cachedLeaderboard = parsed.data;
+                }
+            }
+        } catch (localError) {
+            // localStorage might be disabled, continue to RTDB
+        }
+        
+        // Always read from RTDB (pre-computed) for freshness
         const leaderboardRef = ref(rtdb, 'leaderboard/top10');
         let leaderboardSnap;
         let retryCount = 0;
@@ -1574,41 +2078,42 @@ async function loadLeaderboard() {
                 .map(key => leaderboardData[key])
                 .filter(p => p !== null); // Filter out null entries
             
-        } else {
-            // Fallback to Firestore if RTDB cache doesn't exist after retries
-            throw new Error('RTDB_CACHE_MISS');
-        }
-    } catch (error) {
-        // Fallback to Firestore query
-        if (error.message === 'RTDB_CACHE_MISS' || error.code === 'PERMISSION_DENIED') {
+            // Cache leaderboard for future use
             try {
-                const usersRef = collection(db, 'users');
-                const q = query(usersRef, orderBy('score', 'desc'), limit(10));
-        const querySnapshot = await getDocs(q);
-        
-                participants = [];
-        querySnapshot.forEach((doc) => {
-            const data = doc.data();
-            participants.push({
-                uid: doc.id,
-                ...data
-            });
-        });
-                
-                // Note: RTDB cache updates are handled automatically by Cloud Functions
-                // No need to update cache from client side
-            } catch (firestoreError) {
-                console.error('Error loading leaderboard from Firestore:', firestoreError);
-                return;
+                localStorage.setItem('leaderboard_cache', JSON.stringify({
+                    data: participants,
+                    timestamp: Date.now()
+                }));
+            } catch (localError) {
+                // localStorage might be disabled, ignore
             }
         } else {
-            console.error('Error loading leaderboard:', error);
-            return;
+            // If RTDB cache doesn't exist, use cached data if available
+            if (cachedLeaderboard && cachedLeaderboard.length > 0) {
+                participants = cachedLeaderboard;
+            } else {
+                // Cloud Functions should have pre-computed it during migration
+                participants = [];
+            }
+        }
+    } catch (error) {
+        // Use cached data if available on error
+        if (cachedLeaderboard && cachedLeaderboard.length > 0) {
+            participants = cachedLeaderboard;
+        } else {
+            participants = [];
         }
     }
-        
+    
+    // Display leaderboard
+    await displayLeaderboard(participants);
+}
+
+// Display leaderboard (extracted for reuse)
+async function displayLeaderboard(participants) {
         // Display top 3
         const topThreeContainer = document.getElementById('top-three-container');
+    if (topThreeContainer) {
         topThreeContainer.innerHTML = '';
         
         if (participants.length >= 3) {
@@ -1623,9 +2128,11 @@ async function loadLeaderboard() {
                 createTopThreeCard(participant, index + 1, topThreeContainer);
             });
         }
+        }
         
         // Display rest of leaderboard
         const leaderboardList = document.getElementById('leaderboard-list');
+    if (leaderboardList) {
         leaderboardList.innerHTML = '';
         
         participants.slice(3).forEach((participant, index) => {
@@ -1633,6 +2140,7 @@ async function loadLeaderboard() {
             const item = createLeaderboardItem(participant, rank);
             leaderboardList.appendChild(item);
         });
+    }
         
         // Display current user footer
         await loadCurrentUserFooter(participants);
@@ -1766,10 +2274,80 @@ async function loadCurrentUserFooter(leaderboardParticipants) {
         } else {
             // User is not in top 10, get rank from RTDB cache (much cheaper than reading all users)
             userRank = await getUserLeaderboardRank(currentUser.uid);
+            
+            // If rank is still null, try to calculate it from sorted index or set a default
+            if (userRank === null) {
+                // Try to get from sorted score index
+                try {
+                    const indexRef = ref(rtdb, 'indexes/sortedScores');
+                    const indexSnap = await get(indexRef);
+                    if (indexSnap.exists()) {
+                        const sortedIndex = indexSnap.val() || [];
+                        const userIndex = sortedIndex.findIndex(entry => entry.uid === currentUser.uid);
+                        if (userIndex !== -1) {
+                            // Calculate rank considering ties
+                            let rank = userIndex + 1;
+                            const userScore = sortedIndex[userIndex].score;
+                            for (let i = userIndex - 1; i >= 0; i--) {
+                                if (sortedIndex[i].score === userScore) {
+                                    rank = i + 1;
+                                } else {
+                    break;
+                }
+                            }
+                            userRank = rank;
+                        }
+                    }
+                } catch (error) {
+                    // If all else fails, show "--" (already handled by the template)
+                }
+            }
         }
         
-        const initials = (userData.fullName || userData.displayName || 'U').split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
-        const photoURL = userData.photoURL || (currentUser && currentUser.photoURL) || null;
+        const profile = userData.profile || {};
+        const initials = (profile.fullName || profile.displayName || 'U').split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
+        
+        // Get photoURL - check RTDB first, then Firebase Auth, then admin cache
+        let photoURL = profile.photoURL || userData.photoURL || null;
+        
+        // If no photoURL in RTDB, try multiple sources:
+        // 1. Firebase Auth
+        // 2. Admin cache (if available)
+        if (!photoURL) {
+            // Try Firebase Auth first
+            if (currentUser && currentUser.photoURL) {
+                photoURL = currentUser.photoURL;
+            } else {
+                // Try admin cache as fallback
+                try {
+                    const adminCacheRef = ref(rtdb, 'adminCache/participants');
+                    const adminCacheSnap = await get(adminCacheRef);
+                    if (adminCacheSnap.exists()) {
+                        const cache = adminCacheSnap.val();
+                        const activeUsers = cache.active || [];
+                        const userInCache = activeUsers.find(p => p.id === currentUser.uid);
+                        if (userInCache && userInCache.photoURL) {
+                            photoURL = userInCache.photoURL;
+                        }
+                    }
+                } catch (cacheError) {
+                    // Admin cache read failed, continue
+                }
+            }
+            
+            // If we found a photoURL from any source, update RTDB
+            if (photoURL) {
+                try {
+                    const profileUpdate = {...profile};
+                    profileUpdate.photoURL = photoURL;
+                    await update(ref(rtdb, `users/${currentUser.uid}`), {
+                        profile: profileUpdate
+                    });
+                } catch (updateError) {
+                    // Non-critical, continue
+                }
+            }
+        }
         const footer = document.getElementById('current-user-footer');
         if (!footer) return;
         
@@ -1789,7 +2367,7 @@ async function loadCurrentUserFooter(leaderboardParticipants) {
                 <div class="relative shrink-0">
                     <div class="w-12 h-12 rounded-full border-2 border-primary bg-gradient-to-br from-slate-700 to-slate-900 flex items-center justify-center text-white text-lg font-bold shadow-[0_0_15px_rgba(13,185,242,0.3)] overflow-hidden">
                         ${photoURL ? 
-                            `<img src="${photoURL}" alt="${userData.fullName || userData.displayName || 'User'}" class="w-full h-full object-cover rounded-full" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+                            `<img src="${photoURL}" alt="${profile.fullName || profile.displayName || 'User'}" class="w-full h-full object-cover rounded-full" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
                              <div class="absolute inset-0 bg-gradient-to-br from-slate-700 to-slate-900 flex items-center justify-center text-white text-lg font-bold" style="display: none;">
                         <span class="text-primary">${initials}</span>
                              </div>` :
@@ -1816,32 +2394,33 @@ async function loadCurrentUserFooter(leaderboardParticipants) {
         </div>
     `;
     } catch (error) {
-        console.error('Error loading current user footer:', error);
         // Don't show alert - this is a non-critical feature
     }
 }
 
-// Load connection history
+// Load connection history (RTDB-first)
 async function loadHistory() {
     if (!currentUser) return;
     
     try {
-        const userRef = doc(db, 'users', currentUser.uid);
-        const userSnap = await getDoc(userRef);
+        // Read from RTDB scans/recent
+        const recentRef = ref(rtdb, `scans/recent/${currentUser.uid}`);
+        const recentSnap = await get(recentRef);
         
-        if (!userSnap.exists()) {
-            return;
+        let connections = [];
+        if (recentSnap.exists()) {
+            const recent = recentSnap.val() || [];
+            // Convert to connection format and sort by timestamp (newest first)
+            connections = recent
+                .map(conn => ({
+                    uid: conn.scannedUid,
+                    name: conn.name,
+                    photo: conn.photo,
+                    district: conn.district,
+                    scannedAt: conn.scannedAt
+                }))
+                .sort((a, b) => (b.scannedAt || 0) - (a.scannedAt || 0));
         }
-        
-        const userData = userSnap.data();
-        const scanHistory = userData.scanHistory || [];
-        
-        // Sort by timestamp (newest first)
-        const connections = [...scanHistory].sort((a, b) => {
-            const timeA = a.scannedAt ? (typeof a.scannedAt === 'string' ? new Date(a.scannedAt).getTime() : a.scannedAt.toMillis()) : 0;
-            const timeB = b.scannedAt ? (typeof b.scannedAt === 'string' ? new Date(b.scannedAt).getTime() : b.scannedAt.toMillis()) : 0;
-            return timeB - timeA;
-        });
     
     const historyList = document.getElementById('history-list');
     historyList.innerHTML = '';
@@ -1868,7 +2447,7 @@ async function loadHistory() {
                     hour: '2-digit',
                     minute: '2-digit'
                 })
-                : new Date(scannedAt.toMillis()).toLocaleDateString('en-US', { 
+                : new Date(scannedAt).toLocaleDateString('en-US', { 
                     month: 'short', 
                     day: 'numeric', 
                     year: 'numeric',
@@ -1908,7 +2487,6 @@ async function loadHistory() {
         historyList.appendChild(item);
     });
     } catch (error) {
-        console.error('Error loading history:', error);
         const historyList = document.getElementById('history-list');
         if (historyList) {
             historyList.innerHTML = `
@@ -2064,7 +2642,6 @@ window.saveContactToPhone = async function(connectionData) {
         }
         
     } catch (error) {
-        console.error('Error saving contact:', error);
         showToast('error', 'Failed to save contact', 'error');
     }
 };

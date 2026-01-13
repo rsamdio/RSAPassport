@@ -4,7 +4,8 @@ module.exports = {
     node: true,
   },
   parserOptions: {
-    "ecmaVersion": 2018,
+    "ecmaVersion": 2020,
+    "sourceType": "module",
   },
   extends: [
     "eslint:recommended",
@@ -24,5 +25,6 @@ module.exports = {
       rules: {},
     },
   ],
+  ignorePatterns: ["index.optimized.js", "index.old.js"],
   globals: {},
 };

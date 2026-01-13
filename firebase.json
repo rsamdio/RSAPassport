@@ -1,4 +1,10 @@
 {
+  "database": {
+    "rules": "RTDB_RULES_LATEST.json"
+  },
+  "firestore": {
+    "rules": "FIRESTORE_RULES_LATEST.rules"
+  },
   "functions": [
     {
       "source": "functions",

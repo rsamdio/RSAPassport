@@ -1,13 +1,86 @@
 {
   "rules": {
+    "users": {
+      ".read": "auth != null",
+      "$uid": {
+        ".read": "auth != null",
+        ".write": "auth != null && auth.uid == $uid"
+      }
+    },
     "qrcodes": {
       "$qrToken": {
+        ".read": "auth != null",
+        ".write": "auth != null"
+      }
+    },
+    "scans": {
+      "byScanner": {
+        "$scannerUid": {
+          "$scannedUid": {
+            ".read": "auth != null && auth.uid == $scannerUid",
+            ".write": "auth != null && auth.uid == $scannerUid"
+          }
+        }
+      },
+      "recent": {
+        "$uid": {
+          ".read": "auth != null && auth.uid == $uid",
+          ".write": "auth != null && auth.uid == $uid"
+        }
+      },
+      "pending": {
+        ".read": false,
+        ".write": false
+      }
+    },
+    "pendingScores": {
+      "$batchId": {
+        "$uid": {
+          ".read": false,
+          ".write": "auth != null && auth.uid == $uid"
+        }
+      }
+    },
+    "indexes": {
+      ".read": "auth != null",
+      ".write": "auth != null",
+      "emails": {
+        "$email": {
+          ".read": "auth != null",
+          ".write": "auth != null"
+        }
+      },
+      "participantIds": {
+        "$participantId": {
+          ".read": "auth != null",
+          ".write": "auth != null"
+        }
+      },
+      "qrTokens": {
+        "$qrToken": {
+          ".read": "auth != null",
+          ".write": "auth != null"
+        }
+      },
+      "sortedScores": {
         ".read": "auth != null",
         ".write": false
       }
     },
+    "pendingUsers": {
+      ".read": "auth != null",
+      ".write": "auth != null",
+      "$email": {
+        ".read": "auth != null",
+        ".write": "auth != null"
+      }
+    },
     "leaderboard": {
       "top10": {
+        ".read": "auth != null",
+        ".write": false
+      },
+      "metadata": {
         ".read": "auth != null",
         ".write": false
       }
@@ -15,24 +88,28 @@
     "ranks": {
       "$uid": {
         ".read": "auth != null",
+        ".write": "auth != null && auth.uid == $uid"
+      },
+      "ranges": {
+        ".read": "auth != null",
         ".write": false
       }
     },
     "adminCache": {
       "emails": {
         "$email": {
-          ".read": "auth != null && root.child('admins').child(auth.uid).exists()",
+          ".read": "auth != null",
           ".write": false
         }
       },
       "participantIds": {
         "$participantId": {
-          ".read": "auth != null && root.child('admins').child(auth.uid).exists()",
+          ".read": "auth != null",
           ".write": false
         }
       },
       "participants": {
-        ".read": "auth != null && root.child('admins').child(auth.uid).exists()",
+        ".read": "auth != null",
         ".write": false
       }
     },

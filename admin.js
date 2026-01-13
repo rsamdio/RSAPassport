@@ -36,7 +36,9 @@ import {
     getDatabase, 
     ref, 
     get,
-    set as rtdbSet 
+    set,
+    update,
+    remove
 } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js';
 import { 
     getFunctions, 
@@ -390,7 +392,6 @@ onAuthStateChanged(auth, async (user) => {
                 showLoginPrompt();
             }
         } catch (error) {
-            console.error('Error checking admin status:', error);
             // On error, show login prompt instead of redirecting
             showLoginPrompt();
         }
@@ -413,7 +414,6 @@ if (adminSignInBtn) {
             await signInWithPopup(auth, googleProvider);
             // onAuthStateChanged will handle the rest
         } catch (error) {
-            console.error('Sign-in error:', error);
             showAlert('Sign In Failed', 'Failed to sign in. Please try again.', 'error');
             showLoginPrompt();
         }
@@ -426,7 +426,6 @@ async function checkIfAdmin(uid) {
         const adminSnap = await getDoc(adminRef);
         return adminSnap.exists();
     } catch (error) {
-        console.error('Error checking admin status:', error);
         return false;
     }
 }
@@ -437,13 +436,37 @@ function normalizeEmail(email) {
     return email.toLowerCase().trim();
 }
 
-// Check if email exists in RTDB admin cache
+// Encode email for RTDB path (replaces invalid characters)
+function encodeEmailForPath(email) {
+    if (!email) return null;
+    // RTDB paths can't contain: . # $ [ ] @
+    // Use base64 encoding and replace invalid chars
+    const base64 = btoa(email.toLowerCase().trim());
+    return base64.replace(/[/+=]/g, (m) => {
+        const map = {'/': '_', '+': '-', '=': ''};
+        return map[m] || '';
+    });
+}
+
+// Decode email from RTDB path
+function decodeEmailFromPath(encoded) {
+    if (!encoded) return null;
+    try {
+        const base64 = encoded.replace(/_/g, '/').replace(/-/g, '+');
+        return atob(base64);
+    } catch (e) {
+        return null;
+    }
+}
+
+// Check if email exists in RTDB indexes (RTDB-only, no Firestore fallback)
 async function checkEmailInCache(email) {
     try {
         const normalizedEmail = normalizeEmail(email);
         if (!normalizedEmail) return { exists: false, type: null };
         
-        const emailRef = ref(rtdb, `adminCache/emails/${normalizedEmail}`);
+        const encodedEmail = encodeEmailForPath(normalizedEmail);
+        const emailRef = ref(rtdb, `indexes/emails/${encodedEmail}`);
         const emailSnap = await get(emailRef);
         
         if (emailSnap.exists()) {
@@ -452,20 +475,19 @@ async function checkEmailInCache(email) {
         }
         return { exists: false, type: null };
     } catch (error) {
-        console.error('Error checking email in cache:', error);
-        // Return false on error, will fallback to Firestore
+        // Return false on error - trust RTDB index
         return { exists: false, type: null };
     }
 }
 
-// Check if participantId exists in RTDB admin cache
+// Check if participantId exists in RTDB indexes (RTDB-only, no Firestore fallback)
 async function checkParticipantIdInCache(participantId) {
     try {
         if (!participantId) return { exists: false, type: null };
         const normalizedId = participantId.trim();
         if (!normalizedId) return { exists: false, type: null };
         
-        const participantIdRef = ref(rtdb, `adminCache/participantIds/${normalizedId}`);
+        const participantIdRef = ref(rtdb, `indexes/participantIds/${normalizedId}`);
         const participantIdSnap = await get(participantIdRef);
         
         if (participantIdSnap.exists()) {
@@ -474,8 +496,7 @@ async function checkParticipantIdInCache(participantId) {
         }
         return { exists: false, type: null };
     } catch (error) {
-        console.error('Error checking participantId in cache:', error);
-        // Return false on error, will fallback to Firestore
+        // Return false on error - trust RTDB index
         return { exists: false, type: null };
     }
 }
@@ -578,43 +599,10 @@ document.getElementById('add-participant-form').addEventListener('submit', async
             submitButton.textContent = 'Adding...';
         }
         
-        // Check duplicates using RTDB cache (with Firestore fallback)
+        // Check duplicates using RTDB indexes (RTDB-only, no Firestore fallback)
         const normalizedEmail = email.toLowerCase().trim();
-        let emailCheck = await checkEmailInCache(normalizedEmail);
-        let participantIdCheck = await checkParticipantIdInCache(participantId);
-        
-        // Fallback to Firestore if cache check failed or returned false
-        if (!emailCheck.exists) {
-            // Double-check with Firestore for reliability
-            const pendingUsersRef = collection(db, 'pendingUsers');
-            const usersRef = collection(db, 'users');
-            const pendingEmailQuery = query(pendingUsersRef, where('email', '==', normalizedEmail));
-            const usersEmailQuery = query(usersRef, where('email', '==', normalizedEmail));
-            const [pendingEmailSnap, usersEmailSnap] = await Promise.all([
-                getDocs(pendingEmailQuery),
-                getDocs(usersEmailQuery)
-            ]);
-            
-            if (!pendingEmailSnap.empty || !usersEmailSnap.empty) {
-                emailCheck = { exists: true, type: !pendingEmailSnap.empty ? 'pending' : 'active' };
-            }
-        }
-        
-        if (!participantIdCheck.exists) {
-            // Double-check with Firestore for reliability
-            const pendingUsersRef = collection(db, 'pendingUsers');
-            const usersRef = collection(db, 'users');
-            const pendingIdQuery = query(pendingUsersRef, where('participantId', '==', participantId));
-            const usersIdQuery = query(usersRef, where('participantId', '==', participantId));
-            const [pendingIdSnap, usersIdSnap] = await Promise.all([
-                getDocs(pendingIdQuery),
-                getDocs(usersIdQuery)
-            ]);
-            
-            if (!pendingIdSnap.empty || !usersIdSnap.empty) {
-                participantIdCheck = { exists: true, type: !pendingIdSnap.empty ? 'pending' : 'active' };
-            }
-        }
+        const emailCheck = await checkEmailInCache(normalizedEmail);
+        const participantIdCheck = await checkParticipantIdInCache(participantId);
         
         // Show errors if duplicates found
         if (emailCheck.exists) {
@@ -652,20 +640,81 @@ document.getElementById('add-participant-form').addEventListener('submit', async
         }
         const qrCodeBase64 = await generateQRCodeBase64(qrToken);
         
-        // Create pending user document (email as document ID until first login)
-        const pendingUserRef = doc(db, 'pendingUsers', email);
-        await setDoc(pendingUserRef, {
+        // Encode email for RTDB path
+        const encodedEmail = encodeEmailForPath(normalizedEmail);
+        
+        // Write to RTDB pendingUsers and update indexes
+        const pendingUserRef = ref(rtdb, `pendingUsers/${encodedEmail}`);
+        await set(pendingUserRef, {
             participantId: participantId,
             fullName: fullName,
             district: district,
-            email: email,
+            email: normalizedEmail,
             phone: phone,
             profession: profession,
             qrToken: qrToken,
             qrCodeBase64: qrCodeBase64,
-            createdAt: serverTimestamp(),
+            createdAt: Date.now(),
             status: 'pending'
         });
+        
+        // Update indexes (use encoded email in path)
+        await update(ref(rtdb), {
+            [`indexes/emails/${encodedEmail}`]: {
+                uid: encodedEmail,
+                email: normalizedEmail,
+                type: 'pending',
+                lastUpdated: Date.now()
+            },
+            [`indexes/participantIds/${participantId}`]: {
+                uid: encodedEmail,
+                email: normalizedEmail,
+                type: 'pending',
+                lastUpdated: Date.now()
+            },
+            [`indexes/qrTokens/${qrToken}`]: {
+                uid: encodedEmail,
+                email: normalizedEmail,
+                lastUpdated: Date.now()
+            }
+        });
+        
+        // Update QR code cache
+        await set(ref(rtdb, `qrcodes/${qrToken}`), {
+            uid: normalizedEmail,
+            name: fullName,
+            photo: null,
+            email: normalizedEmail,
+            district: district,
+            phone: phone,
+            profession: profession
+        });
+        
+        if (btnText) {
+            btnText.textContent = 'Updating cache...';
+        } else {
+            submitButton.textContent = 'Updating cache...';
+        }
+        
+        // Update admin cache incrementally
+        try {
+            const functions = getFunctions();
+            const updateAdminCacheIncremental = httpsCallable(functions, 'updateAdminCacheIncremental');
+            
+            const pendingUserRef = ref(rtdb, `pendingUsers/${encodedEmail}`);
+            const pendingSnap = await get(pendingUserRef);
+            
+            if (pendingSnap.exists()) {
+                const userData = pendingSnap.val();
+                await updateAdminCacheIncremental({
+                    uid: encodedEmail,
+                    type: 'pending',
+                    userData: userData
+                });
+            }
+        } catch (cacheError) {
+            // Non-critical - cache will be updated on next refresh
+        }
         
         if (btnText) {
             btnText.textContent = 'Saving...';
@@ -680,7 +729,8 @@ document.getElementById('add-participant-form').addEventListener('submit', async
         
         // Reload participants list if on manage tab
         if (currentTab === 'manage') {
-            loadParticipants();
+            // Force reload from RTDB (bypass cache) to show new participant immediately
+            await loadParticipants(true);
         }
         
         // Re-enable button
@@ -692,7 +742,6 @@ document.getElementById('add-participant-form').addEventListener('submit', async
         }
         
     } catch (error) {
-        console.error('Error adding participant:', error);
         
         // Re-enable button
         submitButton.disabled = false;
@@ -853,21 +902,18 @@ async function checkExistingParticipants(participants) {
         errors.push(`Duplicate Participant IDs in CSV: ${idDuplicates.join(', ')}`);
     }
     
-    // Check against database using RTDB cache (with Firestore fallback)
-    // Batch read all emails from RTDB cache in parallel
+    // Check against database using RTDB indexes (RTDB-only, no Firestore fallback)
+    // Batch read all emails from RTDB indexes in parallel
     const emailChecks = await Promise.all(
         emails.map(email => checkEmailInCache(email))
     );
     
-    // Batch read all participantIds from RTDB cache in parallel
+    // Batch read all participantIds from RTDB indexes in parallel
     const participantIdChecks = await Promise.all(
         participantIds.map(id => checkParticipantIdInCache(id))
     );
     
-    // Check results and fallback to Firestore for cache misses
-    const pendingUsersRef = collection(db, 'pendingUsers');
-    const usersRef = collection(db, 'users');
-    
+    // Check results - trust RTDB indexes completely
     for (let i = 0; i < emails.length; i++) {
         const email = emails[i];
         const emailCheck = emailChecks[i];
@@ -875,25 +921,6 @@ async function checkExistingParticipants(participants) {
         if (emailCheck.exists) {
             const typeText = emailCheck.type === 'pending' ? 'pendingUsers' : 'users';
             errors.push(`Email ${email} already exists in ${typeText}`);
-        } else {
-            // Fallback to Firestore for reliability
-            try {
-                const emailQuery = query(pendingUsersRef, where('email', '==', email));
-                const userEmailQuery = query(usersRef, where('email', '==', email));
-                const [emailSnap, userEmailSnap] = await Promise.all([
-                    getDocs(emailQuery),
-                    getDocs(userEmailQuery)
-                ]);
-                
-                if (!emailSnap.empty) {
-                    errors.push(`Email ${email} already exists in pendingUsers`);
-                } else if (!userEmailSnap.empty) {
-                    errors.push(`Email ${email} already exists in users`);
-                }
-            } catch (error) {
-                console.error(`Error checking email ${email} in Firestore:`, error);
-                // Continue with other checks
-            }
         }
     }
     
@@ -904,25 +931,6 @@ async function checkExistingParticipants(participants) {
         if (participantIdCheck.exists) {
             const typeText = participantIdCheck.type === 'pending' ? 'pendingUsers' : 'users';
             errors.push(`Participant ID ${participantId} already exists in ${typeText}`);
-        } else {
-            // Fallback to Firestore for reliability
-            try {
-                const idQuery = query(pendingUsersRef, where('participantId', '==', participantId));
-                const userIdQuery = query(usersRef, where('participantId', '==', participantId));
-                const [idSnap, userIdSnap] = await Promise.all([
-                    getDocs(idQuery),
-                    getDocs(userIdQuery)
-                ]);
-                
-                if (!idSnap.empty) {
-                    errors.push(`Participant ID ${participantId} already exists in pendingUsers`);
-                } else if (!userIdSnap.empty) {
-                    errors.push(`Participant ID ${participantId} already exists in users`);
-                }
-            } catch (error) {
-                console.error(`Error checking participantId ${participantId} in Firestore:`, error);
-                // Continue with other checks
-            }
         }
     }
     
@@ -970,20 +978,54 @@ async function bulkImportParticipants(participants) {
             const qrToken = generateQRToken();
             const qrCodeBase64 = await generateQRCodeBase64(qrToken);
             
-            // Create pending user document
+            // Create pending user in RTDB
             const email = participant.Email.trim().toLowerCase();
-            const pendingUserRef = doc(db, 'pendingUsers', email);
-            await setDoc(pendingUserRef, {
+            const normalizedEmail = normalizeEmail(email);
+            const encodedEmail = encodeEmailForPath(normalizedEmail);
+            const pendingUserRef = ref(rtdb, `pendingUsers/${encodedEmail}`);
+            await set(pendingUserRef, {
                 participantId: participant.ParticipantID.trim(),
                 fullName: participant.FullName.trim(),
                 district: participant.District.trim(),
-                email: email,
+                email: normalizedEmail,
                 phone: participant.Phone.trim(),
                 profession: participant.Profession.trim(),
                 qrToken: qrToken,
                 qrCodeBase64: qrCodeBase64,
-                createdAt: serverTimestamp(),
+                createdAt: Date.now(),
                 status: 'pending'
+            });
+            
+            // Update indexes (use encoded email in path)
+            await update(ref(rtdb), {
+                [`indexes/emails/${encodedEmail}`]: {
+                    uid: encodedEmail,
+                    email: normalizedEmail,
+                    type: 'pending',
+                    lastUpdated: Date.now()
+                },
+                [`indexes/participantIds/${participant.ParticipantID.trim()}`]: {
+                    uid: encodedEmail,
+                    email: normalizedEmail,
+                    type: 'pending',
+                    lastUpdated: Date.now()
+                },
+                [`indexes/qrTokens/${qrToken}`]: {
+                    uid: encodedEmail,
+                    email: normalizedEmail,
+                    lastUpdated: Date.now()
+                }
+            });
+            
+            // Update QR code cache
+            await set(ref(rtdb, `qrcodes/${qrToken}`), {
+                uid: normalizedEmail,
+                name: participant.FullName.trim(),
+                photo: null,
+                email: normalizedEmail,
+                district: participant.District.trim(),
+                phone: participant.Phone.trim(),
+                profession: participant.Profession.trim()
             });
             
             results.success.push({
@@ -996,6 +1038,40 @@ async function bulkImportParticipants(participants) {
                 participant: participant,
                 errors: [error.message]
             });
+        }
+    }
+    
+    // Update admin cache incrementally for all successfully imported participants
+    if (results.success.length > 0) {
+        try {
+            const functions = getFunctions();
+            const updateAdminCacheIncremental = httpsCallable(functions, 'updateAdminCacheIncremental');
+            
+            // Update cache for each successful participant
+            const updatePromises = results.success.map(async (result) => {
+                const participant = result.participant;
+                const email = participant.Email.trim().toLowerCase();
+                const normalizedEmail = normalizeEmail(email);
+                const encodedEmail = encodeEmailForPath(normalizedEmail);
+                
+                // Get the participant data from RTDB
+                const pendingUserRef = ref(rtdb, `pendingUsers/${encodedEmail}`);
+                const pendingSnap = await get(pendingUserRef);
+                
+                if (pendingSnap.exists()) {
+                    const userData = pendingSnap.val();
+                    await updateAdminCacheIncremental({
+                        uid: encodedEmail,
+                        type: 'pending',
+                        userData: userData
+                    });
+                }
+            });
+            
+            // Wait for all cache updates (but don't fail if some fail)
+            await Promise.allSettled(updatePromises);
+        } catch (cacheError) {
+            // Non-critical - cache will be updated on next refresh or when stale
         }
     }
     
@@ -1016,9 +1092,9 @@ async function bulkImportParticipants(participants) {
     
     resultsText.textContent = resultsMessage;
     
-    // Reload participants if on manage tab
+    // Reload participants if on manage tab (force refresh to show new participants)
     if (currentTab === 'manage') {
-        loadParticipants();
+        await loadParticipants(true);
     }
     
     return results;
@@ -1069,7 +1145,6 @@ document.getElementById('upload-csv-btn').addEventListener('click', async () => 
             
             // Import
             bulkImportParticipants(participants).catch(error => {
-                console.error('Error importing participants:', error);
                 showAlert('Import Error', 'Error importing participants: ' + error.message, 'error');
             });
         });
@@ -1079,7 +1154,6 @@ document.getElementById('upload-csv-btn').addEventListener('click', async () => 
         await bulkImportParticipants(participants);
         
     } catch (error) {
-        console.error('Error uploading CSV:', error);
         showAlert('Upload Error', 'Error uploading CSV: ' + error.message, 'error');
     }
 });
@@ -1179,7 +1253,6 @@ async function loadRanks() {
         }).join('');
         
     } catch (error) {
-        console.error('Error loading ranks:', error);
         ranksList.innerHTML = '<tr><td colspan="5" class="text-center py-8 text-red-400">Error loading ranks: ' + error.message + '</td></tr>';
     }
 }
@@ -1221,7 +1294,6 @@ window.editRank = async function(index) {
         document.getElementById('rank-order').value = rankData.order;
         document.getElementById('rank-modal').classList.remove('hidden');
     } catch (error) {
-        console.error('Error loading rank for edit:', error);
         showAlert('Error', 'Error loading rank: ' + error.message, 'error');
     }
 };
@@ -1258,7 +1330,6 @@ window.deleteRank = async function(index) {
             showAlert('Success', 'Rank deleted successfully', 'success');
             loadRanks();
         } catch (error) {
-            console.error('Error deleting rank:', error);
             showAlert('Error', 'Error deleting rank: ' + error.message, 'error');
         }
     });
@@ -1341,7 +1412,6 @@ document.getElementById('rank-form').addEventListener('submit', async (e) => {
         document.getElementById('rank-modal').classList.add('hidden');
         loadRanks();
     } catch (error) {
-        console.error('Error saving rank:', error);
         showAlert('Error', 'Error saving rank: ' + error.message, 'error');
     }
 });
@@ -1352,7 +1422,8 @@ document.getElementById('rank-modal-cancel').addEventListener('click', () => {
 });
 
 // Load Participants (Enhanced)
-async function loadParticipants() {
+// @param {boolean} forceRefresh - If true, bypass cache and load directly from RTDB
+async function loadParticipants(forceRefresh = false) {
     const participantsList = document.getElementById('participants-list');
     if (!participantsList) return;
     
@@ -1362,76 +1433,118 @@ async function loadParticipants() {
         let participants = [];
         let useCache = false;
         
-        // Try to load from RTDB cache first
-        try {
-            const participantsRef = ref(rtdb, 'adminCache/participants');
-            const participantsSnap = await get(participantsRef);
-            
-            if (participantsSnap.exists()) {
-                const cacheData = participantsSnap.val();
-                const lastUpdated = cacheData.lastUpdated || 0;
-                const now = Date.now();
-                const staleThreshold = 5 * 60 * 1000; // 5 minutes
+        // Try to load from RTDB cache first (unless force refresh)
+        if (!forceRefresh) {
+            try {
+                const participantsRef = ref(rtdb, 'adminCache/participants');
+                const participantsSnap = await get(participantsRef);
                 
-                // Use cache if it's not stale
-                if (now - lastUpdated < staleThreshold && cacheData.pending && cacheData.active) {
-                    participants = [
-                        ...(cacheData.pending || []),
-                        ...(cacheData.active || [])
-                    ];
-                    useCache = true;
+                if (participantsSnap.exists()) {
+                    const cacheData = participantsSnap.val();
+                    const lastUpdated = cacheData.lastUpdated || 0;
+                    const now = Date.now();
+                    const staleThreshold = 5 * 60 * 1000; // 5 minutes
+                    
+                    // Use cache if it's not stale
+                    if (now - lastUpdated < staleThreshold && cacheData.pending && cacheData.active) {
+                        // Process pending users from cache - ensure identifier is encoded email
+                        const pendingUsers = (cacheData.pending || []).map(user => {
+                            // For pending users, id should be encoded email
+                            // If it's not encoded, encode it
+                            let identifier = user.id;
+                            if (user.email && !identifier.includes('_')) {
+                                // If identifier doesn't look encoded (no underscores), encode it
+                                const normalizedEmail = normalizeEmail(user.email);
+                                identifier = encodeEmailForPath(normalizedEmail);
+                            }
+                            return {
+                                ...user,
+                                identifier: identifier || user.id, // Use encoded email as identifier
+                                type: 'pending'
+                            };
+                        });
+                        
+                        // Flatten profile data for active users in cache
+                        const activeUsers = (cacheData.active || []).map(user => {
+                            const profile = user.profile || {};
+                            return {
+                                ...user,
+                                identifier: user.id, // uid for active users
+                                type: 'active',
+                                fullName: profile.fullName || user.fullName || null,
+                                displayName: profile.displayName || user.displayName || null,
+                                district: profile.district || user.district || null,
+                                phone: profile.phone || user.phone || null,
+                                profession: profile.profession || user.profession || null,
+                                photoURL: profile.photoURL || user.photoURL || null
+                            };
+                        });
+                        participants = [
+                            ...pendingUsers,
+                            ...activeUsers
+                        ];
+                        useCache = true;
+                    }
                 }
+            } catch (error) {
+                // Fallback to RTDB direct read
             }
-        } catch (error) {
-            // Fallback to Firestore
         }
         
-        // Fallback to Firestore if cache is empty or stale
+        // If cache is stale, read directly from RTDB (no Firestore fallback)
         if (!useCache) {
-            const pendingUsersRef = collection(db, 'pendingUsers');
-            const usersRef = collection(db, 'users');
+            const pendingUsersRef = ref(rtdb, 'pendingUsers');
+            const usersRef = ref(rtdb, 'users');
             
-            // Query pendingUsers ordered by createdAt
-            let pendingSnapshot;
-            try {
-                pendingSnapshot = await getDocs(query(pendingUsersRef, orderBy('createdAt', 'desc')));
-            } catch (error) {
-                pendingSnapshot = await getDocs(pendingUsersRef);
-            }
+            const [pendingSnap, usersSnap] = await Promise.all([
+                get(pendingUsersRef),
+                get(usersRef)
+            ]);
             
-            // Query users ordered by firstLoginAt
-            let usersSnapshot;
-            try {
-                usersSnapshot = await getDocs(query(usersRef, orderBy('firstLoginAt', 'desc')));
-            } catch (error) {
-                usersSnapshot = await getDocs(usersRef);
-            }
-            
-            // Add pending users
-            pendingSnapshot.forEach((doc) => {
-                const data = doc.data();
-                participants.push({
-                    id: doc.id,
-                    type: 'pending',
-                    identifier: doc.id, // email
-                    sortDate: data.createdAt ? data.createdAt.toMillis() : 0,
-                    ...data
+            // Add pending users (child.key is encoded email)
+            if (pendingSnap.exists()) {
+                pendingSnap.forEach((child) => {
+                    const data = child.val();
+                    participants.push({
+                        id: child.key, // encoded email
+                        type: 'pending',
+                        identifier: child.key, // encoded email (for delete/view operations)
+                        email: data.email || decodeEmailFromPath(child.key), // actual email
+                        sortDate: data.createdAt || 0,
+                        ...data
+                    });
                 });
-            });
+            }
             
             // Add active users
-            usersSnapshot.forEach((doc) => {
-                const data = doc.data();
-                participants.push({
-                    id: doc.id,
-                    type: 'active',
-                    identifier: doc.id, // uid
-                    uid: doc.id,
-                    sortDate: data.firstLoginAt ? data.firstLoginAt.toMillis() : 
-                             data.lastLoginAt ? data.lastLoginAt.toMillis() : 0,
-                    ...data
+            if (usersSnap.exists()) {
+                usersSnap.forEach((child) => {
+                    const data = child.val();
+                    const profile = data.profile || {};
+                    participants.push({
+                        id: child.key,
+                        type: 'active',
+                        identifier: child.key, // uid
+                        uid: child.key,
+                        sortDate: data.firstLoginAt || data.lastLoginAt || 0,
+                        // Flatten profile data for compatibility
+                        fullName: profile.fullName || data.fullName || null,
+                        displayName: profile.displayName || data.displayName || null,
+                        district: profile.district || data.district || null,
+                        phone: profile.phone || data.phone || null,
+                        profession: profile.profession || data.profession || null,
+                        photoURL: profile.photoURL || data.photoURL || null,
+                        // Keep other fields
+                        email: data.email,
+                        participantId: data.participantId,
+                        score: data.score,
+                        rank: data.rank,
+                        qrToken: data.qrToken,
+                        firstLoginAt: data.firstLoginAt,
+                        lastLoginAt: data.lastLoginAt
+                    });
                 });
-            });
+            }
         }
         
         // Sort all participants by date (newest first)
@@ -1448,7 +1561,23 @@ async function loadParticipants() {
         }
         
         participantsList.innerHTML = participants.map(participant => {
-            const identifier = participant.identifier;
+            // Ensure identifier is set - use id if identifier is missing
+            let identifier = participant.identifier || participant.id;
+            
+            // For pending users, ensure identifier is encoded email
+            if (participant.type === 'pending' && !identifier) {
+                // Fallback: encode email if available
+                if (participant.email) {
+                    const normalizedEmail = normalizeEmail(participant.email);
+                    identifier = encodeEmailForPath(normalizedEmail);
+                }
+            }
+            
+            // If still no identifier, skip this participant (shouldn't happen)
+            if (!identifier) {
+                return '';
+            }
+            
             const statusText = participant.type === 'pending' ? 'Pending Login' : 'Active';
             const statusClass = participant.type === 'pending' ? 'bg-yellow-500/20 text-yellow-400' : 'bg-green-500/20 text-green-400';
             const rank = participant.rank || 'N/A';
@@ -1485,7 +1614,6 @@ async function loadParticipants() {
         }).join('');
         
     } catch (error) {
-        console.error('Error loading participants:', error);
         participantsList.innerHTML = '<tr><td colspan="6" class="text-center py-8 text-red-400">Error loading participants: ' + error.message + '</td></tr>';
     }
 }
@@ -1540,66 +1668,60 @@ async function exportAllParticipants() {
                 }
             }
         } catch (error) {
-            // Fallback to Firestore
+            // Continue to read directly from RTDB
         }
         
-        // Fallback to Firestore if cache is empty or stale
+        // If cache is stale, read directly from RTDB (no Firestore fallback)
         if (!useCache) {
-            const pendingUsersRef = collection(db, 'pendingUsers');
-            const usersRef = collection(db, 'users');
+            const pendingUsersRef = ref(rtdb, 'pendingUsers');
+            const usersRef = ref(rtdb, 'users');
             
-            // Query pendingUsers
-            let pendingSnapshot;
-            try {
-                pendingSnapshot = await getDocs(query(pendingUsersRef, orderBy('createdAt', 'desc')));
-            } catch (error) {
-                pendingSnapshot = await getDocs(pendingUsersRef);
-            }
-            
-            // Query users
-            let usersSnapshot;
-            try {
-                usersSnapshot = await getDocs(query(usersRef, orderBy('firstLoginAt', 'desc')));
-            } catch (error) {
-                usersSnapshot = await getDocs(usersRef);
-            }
+            const [pendingSnap, usersSnap] = await Promise.all([
+                get(pendingUsersRef),
+                get(usersRef)
+            ]);
             
             // Add pending users
-            pendingSnapshot.forEach((doc) => {
-                const data = doc.data();
-                participants.push({
-                    participantId: data.participantId || 'N/A',
-                    fullName: data.fullName || 'N/A',
-                    district: data.district || 'N/A',
-                    email: data.email || 'N/A',
-                    phone: data.phone || 'N/A',
-                    profession: data.profession || 'N/A',
-                    status: 'Pending Login',
-                    rank: 'N/A',
-                    score: 0,
-                    date: data.createdAt ? new Date(data.createdAt.toMillis()).toLocaleDateString() : 'N/A',
-                    type: 'pending'
+            if (pendingSnap.exists()) {
+                pendingSnap.forEach((child) => {
+                    const data = child.val();
+                    participants.push({
+                        participantId: data.participantId || 'N/A',
+                        fullName: data.fullName || 'N/A',
+                        district: data.district || 'N/A',
+                        email: data.email || 'N/A',
+                        phone: data.phone || 'N/A',
+                        profession: data.profession || 'N/A',
+                        status: 'Pending Login',
+                        rank: 'N/A',
+                        score: 0,
+                        date: data.createdAt ? new Date(data.createdAt).toLocaleDateString() : 'N/A',
+                        type: 'pending'
+                    });
                 });
-            });
+            }
             
             // Add active users
-            usersSnapshot.forEach((doc) => {
-                const data = doc.data();
-                participants.push({
-                    participantId: data.participantId || 'N/A',
-                    fullName: data.fullName || data.displayName || 'N/A',
-                    district: data.district || 'N/A',
-                    email: data.email || 'N/A',
-                    phone: data.phone || 'N/A',
-                    profession: data.profession || 'N/A',
-                    status: 'Active',
-                    rank: data.rank || 'N/A',
-                    score: data.score || 0,
-                    date: data.lastLoginAt ? new Date(data.lastLoginAt.toMillis()).toLocaleDateString() : 
-                          data.firstLoginAt ? new Date(data.firstLoginAt.toMillis()).toLocaleDateString() : 'N/A',
-                    type: 'active'
+            if (usersSnap.exists()) {
+                usersSnap.forEach((child) => {
+                    const data = child.val();
+                    const profile = data.profile || {};
+                    participants.push({
+                        participantId: data.participantId || 'N/A',
+                        fullName: profile.fullName || profile.displayName || 'N/A',
+                        district: profile.district || 'N/A',
+                        email: data.email || 'N/A',
+                        phone: profile.phone || 'N/A',
+                        profession: profile.profession || 'N/A',
+                        status: 'Active',
+                        rank: data.rank || 'N/A',
+                        score: data.score || 0,
+                        date: data.lastLoginAt ? new Date(data.lastLoginAt).toLocaleDateString() : 
+                              data.firstLoginAt ? new Date(data.firstLoginAt).toLocaleDateString() : 'N/A',
+                        type: 'active'
+                    });
                 });
-            });
+            }
         }
         
         // Sort by date (newest first)
@@ -1649,7 +1771,6 @@ async function exportAllParticipants() {
         showAlert('Export Successful', `Successfully exported ${participants.length} participants!`, 'success');
         
     } catch (error) {
-        console.error('Error exporting participants:', error);
         showAlert('Export Error', 'Error exporting participants: ' + error.message, 'error');
         
         // Reset button
@@ -1665,61 +1786,91 @@ if (exportParticipantsBtn) {
     exportParticipantsBtn.addEventListener('click', exportAllParticipants);
 }
 
-// View QR Code
+// View QR Code (RTDB-first)
 window.viewQRCode = async function(identifier, type) {
     try {
         let participant = null;
         let qrToken = null;
         
-        // Try to get qrToken from RTDB cache first (for active users)
-        if (type === 'active') {
-            try {
-                // First, get user document to find qrToken
-                const userRef = doc(db, 'users', identifier);
-                const userSnap = await getDoc(userRef);
-                if (userSnap.exists()) {
-                    const userData = userSnap.data();
-                    qrToken = userData.qrToken;
-                    
-                    // Try RTDB cache for QR code data
-                    if (qrToken) {
-                        const qrTokenRef = ref(rtdb, `qrcodes/${qrToken}`);
-                        const qrTokenSnap = await get(qrTokenRef);
-                        if (qrTokenSnap.exists()) {
-                            const qrData = qrTokenSnap.val();
-                            participant = {
-                                qrCodeBase64: userData.qrCodeBase64, // Still need from Firestore
-                                qrToken: qrToken,
-                                fullName: qrData.name || userData.fullName,
-                                displayName: qrData.name || userData.displayName
-                            };
-                        }
-                    }
-                    }
-                } catch (error) {
-                    // Fallback to Firestore
-                }
-        }
-        
-        // Fallback to Firestore if cache miss
-        if (!participant) {
-            let participantRef;
-            if (type === 'pending') {
-                participantRef = doc(db, 'pendingUsers', identifier);
-            } else {
-                participantRef = doc(db, 'users', identifier);
+        // Read from RTDB
+        if (type === 'pending') {
+            const pendingUserRef = ref(rtdb, `pendingUsers/${identifier}`);
+            const pendingSnap = await get(pendingUserRef);
+            if (pendingSnap.exists()) {
+                participant = pendingSnap.val();
+                qrToken = participant.qrToken;
             }
-            
-            const participantSnap = await getDoc(participantRef);
-            
-            if (participantSnap.exists()) {
-                participant = participantSnap.data();
+        } else {
+            const userRef = ref(rtdb, `users/${identifier}`);
+            const userSnap = await get(userRef);
+            if (userSnap.exists()) {
+                const userData = userSnap.val();
+                qrToken = userData.qrToken;
+                const profile = userData.profile || {};
+                participant = {
+                    qrCodeBase64: userData.qrCodeBase64 || null, // Read from RTDB user document
+                    qrToken: qrToken,
+                    fullName: profile.fullName || userData.fullName,
+                    displayName: profile.displayName || userData.displayName
+                };
+                
+                // If qrCodeBase64 is not in RTDB, try to get from Firestore as fallback
+                if (!participant.qrCodeBase64 && qrToken) {
+                    try {
+                        const userDocRef = doc(db, 'users', identifier);
+                        const userDocSnap = await getDoc(userDocRef);
+                        if (userDocSnap.exists()) {
+                            const firestoreData = userDocSnap.data();
+                            participant.qrCodeBase64 = firestoreData.qrCodeBase64 || null;
+                            
+                            // If found in Firestore, update RTDB for future use
+                            if (participant.qrCodeBase64) {
+                                await update(ref(rtdb, `users/${identifier}`), {
+                                    qrCodeBase64: participant.qrCodeBase64
+                                });
+                            }
+                        }
+                    } catch (error) {
+                        // Firestore fallback failed, continue without it
+                    }
+                }
             }
         }
         
         if (participant) {
-            const qrCodeBase64 = participant.qrCodeBase64;
+            // Get QR code base64 - for pending users it's in the document, for active users we may need to generate
+            let qrCodeBase64 = participant.qrCodeBase64;
             const name = participant.fullName || participant.displayName || 'User';
+            
+            // If no base64, try to get from pendingUsers (for pending) or generate from qrToken
+            if (!qrCodeBase64 && type === 'pending') {
+                qrCodeBase64 = participant.qrCodeBase64;
+            }
+            
+            // If still no QR code, try to generate it from token
+            if (!qrCodeBase64 && qrToken) {
+                try {
+                    if (verifyQRCodeLibrary()) {
+                        qrCodeBase64 = await generateQRCodeBase64(qrToken);
+                        // Save to RTDB for future use
+                        if (type === 'pending') {
+                            await update(ref(rtdb, `pendingUsers/${identifier}`), {
+                                qrCodeBase64: qrCodeBase64
+                            });
+                        } else {
+                            await update(ref(rtdb, `users/${identifier}`), {
+                                qrCodeBase64: qrCodeBase64
+                            });
+                        }
+                    } else {
+                        showAlert('Error', 'QR code library not loaded. Please refresh the page and try again.', 'error');
+                        return;
+                    }
+                } catch (genError) {
+                    showAlert('Error', 'Could not generate QR code. QR Token: ' + (qrToken ? qrToken.substring(0, 16) + '...' : 'N/A'), 'warning');
+                    return;
+                }
+            }
             
             if (!qrCodeBase64) {
                 showAlert('Error', 'QR code not found for this participant', 'error');
@@ -1765,12 +1916,11 @@ window.viewQRCode = async function(identifier, type) {
             showAlert('Error', 'Participant not found', 'error');
         }
     } catch (error) {
-        console.error('Error viewing QR code:', error);
         showAlert('Error', 'Error loading QR code', 'error');
     }
 };
 
-// Delete Participant
+// Delete Participant (RTDB-only)
 window.deleteParticipant = async function(identifier, type) {
     const confirmMessage = type === 'pending' 
         ? 'Are you sure you want to delete this pending participant? This will prevent them from logging in.'
@@ -1780,40 +1930,83 @@ window.deleteParticipant = async function(identifier, type) {
         if (!confirmed) return;
         
         try {
-            let participantRef;
+            let participantData = null;
             let qrToken = null;
+            let email = null;
+            let participantId = null;
             
+            // Get participant data from RTDB
             if (type === 'pending') {
-                participantRef = doc(db, 'pendingUsers', identifier);
-                const pendingSnap = await getDoc(participantRef);
+                // For pending users, identifier should be encoded email
+                // But handle case where it might be raw email
+                let encodedIdentifier = identifier;
+                
+                // If identifier doesn't look encoded (contains @), encode it
+                if (identifier.includes('@')) {
+                    const normalizedEmail = normalizeEmail(identifier);
+                    encodedIdentifier = encodeEmailForPath(normalizedEmail);
+                }
+                
+                const pendingUserRef = ref(rtdb, `pendingUsers/${encodedIdentifier}`);
+                const pendingSnap = await get(pendingUserRef);
                 if (pendingSnap.exists()) {
-                    qrToken = pendingSnap.data().qrToken;
+                    participantData = pendingSnap.val();
+                    qrToken = participantData.qrToken;
+                    email = participantData.email || decodeEmailFromPath(encodedIdentifier);
+                    participantId = participantData.participantId;
+                } else {
+                    // Try with raw email if encoded didn't work
+                    if (identifier.includes('@')) {
+                        const normalizedEmail = normalizeEmail(identifier);
+                        const altEncoded = encodeEmailForPath(normalizedEmail);
+                        if (altEncoded !== encodedIdentifier) {
+                            const altRef = ref(rtdb, `pendingUsers/${altEncoded}`);
+                            const altSnap = await get(altRef);
+                            if (altSnap.exists()) {
+                                participantData = altSnap.val();
+                                qrToken = participantData.qrToken;
+                                email = participantData.email || identifier;
+                                participantId = participantData.participantId;
+                                encodedIdentifier = altEncoded; // Update for deletion
+                            }
+                        }
+                    }
+                }
+                
+                // Update identifier to encoded version for deletion
+                if (participantData) {
+                    identifier = encodedIdentifier;
                 }
             } else {
-                participantRef = doc(db, 'users', identifier);
-                const userSnap = await getDoc(participantRef);
+                const userRef = ref(rtdb, `users/${identifier}`);
+                const userSnap = await get(userRef);
                 if (userSnap.exists()) {
-                    qrToken = userSnap.data().qrToken;
+                    participantData = userSnap.val();
+                    qrToken = participantData.qrToken;
+                    email = participantData.email;
+                    participantId = participantData.participantId;
                 }
             }
             
-            // Delete from Firestore
-            await deleteDoc(participantRef);
-            
-            // Delete from RTDB if qrToken exists
-            if (qrToken) {
-                try {
-                    const qrTokenRef = ref(rtdb, `qrcodes/${qrToken}`);
-                    await rtdbSet(qrTokenRef, null);
-                } catch (rtdbError) {
-                    // Non-critical, Cloud Functions will clean up
-                }
+            if (!participantData) {
+                showAlert('Error', 'Participant not found', 'error');
+                return;
             }
+            
+            // Delete via Cloud Function (admin-only, handles all cleanup)
+            // RTDB triggers will automatically update admin cache
+            const deleteUser = httpsCallable(functions, 'deleteUser');
+            
+            await deleteUser({
+                uid: identifier,
+                type: type
+            });
             
             showAlert('Success', 'Participant deleted successfully', 'success');
-            loadParticipants();
+            
+            // Reload participants (force refresh to see changes immediately)
+            await loadParticipants(true);
         } catch (error) {
-            console.error('Error deleting participant:', error);
             showAlert('Error', 'Error deleting participant: ' + error.message, 'error');
         }
     });
@@ -1863,7 +2056,7 @@ async function loadLeaderboard() {
                             fullName: p.name,
                             displayName: p.name,
                             district: p.district || 'N/A',
-                            email: p.email || 'N/A',
+                            email: p.email || null, // Keep null, will show 'N/A' in display
                             score: p.score || 0,
                             rank: p.rank || 'N/A'
                         }));
@@ -1885,20 +2078,10 @@ async function loadLeaderboard() {
             }
         }
         
-        // Fallback to Firestore if cache is empty or failed
+        // If cache is empty, show empty leaderboard (no Firestore fallback)
+        // Cloud Functions should have pre-computed it during migration
         if (!useCache || leaderboard.length === 0) {
-            const usersRef = collection(db, 'users');
-            // Use composite index for tie-breaking: score (desc) then firstLoginAt (asc)
-            // Index: Collection: users, Fields: score (Descending), firstLoginAt (Ascending)
-            const usersQuery = query(usersRef, orderBy('score', 'desc'), orderBy('firstLoginAt', 'asc'));
-            const usersSnapshot = await getDocs(usersQuery);
-            
-            usersSnapshot.forEach((doc) => {
-                leaderboard.push({
-                    uid: doc.id,
-                    ...doc.data()
-                });
-            });
+            leaderboard = [];
         }
         
         if (leaderboard.length === 0) {
@@ -1924,7 +2107,6 @@ async function loadLeaderboard() {
         }).join('');
         
     } catch (error) {
-        console.error('Error loading leaderboard:', error);
         leaderboardList.innerHTML = '<tr><td colspan="6" class="text-center py-8 text-red-400">Error loading leaderboard: ' + error.message + '</td></tr>';
     }
 }
@@ -1938,6 +2120,32 @@ if (refreshLeaderboardBtn) {
 }
 
 // Refresh All Caches
+// Sync Firestore to RTDB button (one-time migration)
+const syncFirestoreBtn = document.getElementById('sync-firestore-btn');
+if (syncFirestoreBtn) {
+    syncFirestoreBtn.addEventListener('click', async () => {
+        try {
+            syncFirestoreBtn.disabled = true;
+            syncFirestoreBtn.textContent = 'Syncing...';
+            
+            const syncFirestoreToRTDB = httpsCallable(functions, 'syncFirestoreToRTDB');
+            const result = await syncFirestoreToRTDB();
+            
+            showAlert('Success', result.data.message || 'Users synced successfully!', 'success');
+            
+            // Reload participants
+            if (currentTab === 'manage') {
+                loadParticipants();
+            }
+        } catch (error) {
+            showAlert('Error', 'Error syncing: ' + error.message, 'error');
+        } finally {
+            syncFirestoreBtn.disabled = false;
+            syncFirestoreBtn.textContent = 'Sync Firestore to RTDB';
+        }
+    });
+}
+
 const refreshAllCachesBtn = document.getElementById('refresh-all-caches-btn');
 if (refreshAllCachesBtn) {
     refreshAllCachesBtn.addEventListener('click', async () => {
@@ -1960,7 +2168,6 @@ if (refreshAllCachesBtn) {
                 showAlert('Error', 'Failed to refresh caches', 'error');
             }
         } catch (error) {
-            console.error('Error refreshing all caches:', error);
             showAlert('Error', 'Error refreshing caches: ' + error.message, 'error');
         } finally {
             refreshAllCachesBtn.disabled = false;
