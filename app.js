@@ -314,30 +314,11 @@ async function migratePendingUser(uid, normalizedEmail, pendingData) {
             throw new Error('qrToken missing from pendingUsers document');
         }
         
-        const userRef = doc(db, 'users', uid);
-        
         // Calculate initial rank
         const initialRank = await calculateRank(0);
         
-        // Create user document with all fields (Firestore - backup)
-        await setDoc(userRef, {
-            email: normalizedEmail,
-            participantId: pendingData.participantId || null,
-            fullName: pendingData.fullName || null,
-            district: pendingData.district || null,
-            phone: pendingData.phone || null,
-            profession: pendingData.profession || null,
-            displayName: null, // Will be updated from auth
-            photoURL: null, // Will be updated from auth
-            score: 0,
-            rank: initialRank,
-            scanHistory: [],
-            qrCodeBase64: pendingData.qrCodeBase64 || null,
-            qrToken: qrToken, // Store for RTDB updates
-            firstLoginAt: serverTimestamp()
-        });
-        
-        // Also update RTDB immediately (RTDB-first architecture)
+        // Update RTDB immediately (RTDB-first architecture)
+        // Firestore backup is handled by hourlyFirestoreBackup Cloud Function
         const encodedEmail = encodeEmailForPath(normalizedEmail);
         const userRTDBRef = ref(rtdb, `users/${uid}`);
         
@@ -383,65 +364,26 @@ async function migratePendingUser(uid, normalizedEmail, pendingData) {
             displayName: authDisplayName !== undefined ? authDisplayName : null,
         };
         
-        // Update user and QR code atomically using batch update
-        // This ensures both are updated together, preventing race conditions
-        const qrCodeRef = ref(rtdb, `qrcodes/${qrToken}`);
-        const batchUpdates = {
-            [`users/${uid}`]: {
-                email: normalizedEmail,
-                participantId: pendingData.participantId || null,
-                qrToken: qrToken,
-                qrCodeBase64: pendingData.qrCodeBase64 || null,
-                score: 0,
-                rank: initialRank,
-                profile: profile,
-                firstLoginAt: Date.now(),
-                lastLoginAt: Date.now(),
-            },
-            [`qrcodes/${qrToken}`]: {
-                uid: uid, // Update from encoded email to actual uid
-                name: profile.fullName || profile.displayName || 'User',
-                photo: profile.photoURL !== undefined ? profile.photoURL : null, // Explicit null if undefined
-                email: normalizedEmail || null,
-                district: profile.district !== undefined ? profile.district : null,
-                phone: profile.phone !== undefined ? profile.phone : null,
-                profession: profile.profession !== undefined ? profile.profession : null
-            }
-        };
+        // Update user in RTDB
+        // QR code will be created/updated by onUserCreated RTDB trigger
+        await set(userRTDBRef, {
+            email: normalizedEmail,
+            participantId: pendingData.participantId || null,
+            qrToken: qrToken,
+            qrCodeBase64: pendingData.qrCodeBase64 || null,
+            score: 0,
+            rank: initialRank,
+            profile: profile,
+            firstLoginAt: Date.now(),
+            lastLoginAt: Date.now(),
+        });
         
-        // Execute batch update atomically
-        await update(ref(rtdb), batchUpdates);
-        
-        // After user creation, ensure photoURL is synced from Firebase Auth
-        // This handles cases where photoURL wasn't available during migration (e.g., OAuth in incognito)
-        // Wait a moment for Firebase Auth to fully load, then sync photoURL if available
-        if (!authPhotoURL && currentUser) {
-            // Give Firebase Auth more time to load profile data
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            // Try reloading user to get fresh profile data
-            try {
-                await currentUser.reload();
-                if (currentUser.photoURL) {
-                    authPhotoURL = currentUser.photoURL;
-                    // Update RTDB with photoURL from Firebase Auth
-                    const currentProfile = profile;
-                    await update(ref(rtdb, `users/${uid}`), {
-                        profile: {
-                            ...currentProfile,
-                            photoURL: authPhotoURL
-                        }
-                    });
-                    // Also update QR code with photo
-                    if (qrToken) {
-                        await update(ref(rtdb, `qrcodes/${qrToken}`), {
-                            photo: authPhotoURL
-                        });
-                    }
-                }
-            } catch (reloadError) {
-                // Reload failed, continue - Cloud Function will sync it later
-            }
-        }
+        // onUserCreated RTDB trigger will handle:
+        // - QR code creation/update
+        // - PhotoURL syncing from Firebase Auth (if missing)
+        // - Admin cache updates
+        // - Rank calculation
+        // - Leaderboard updates
         
         // Clean up all scan records for new user (first login)
         // This ensures deleted users who are re-added can scan everyone again
@@ -513,7 +455,7 @@ async function migratePendingUser(uid, normalizedEmail, pendingData) {
             
             // Add new user to index (at the end since score is 0)
             sortedIndex.push({
-                uid: uid,
+            uid: uid,
                 score: 0,
                 firstLoginAt: Date.now(),
             });
@@ -581,76 +523,11 @@ async function migratePendingUser(uid, normalizedEmail, pendingData) {
     }
 }
 
-// Sync photoURL from admin cache to user cache if user cache is missing it
-async function syncPhotoURLFromAdminCache(uid) {
-    try {
-        // Check if user cache has photoURL
-        const userRTDBRef = ref(rtdb, `users/${uid}`);
-        const userRTDBSnap = await get(userRTDBRef);
-        
-        if (userRTDBSnap.exists()) {
-            const userData = userRTDBSnap.val();
-            const profile = userData.profile || {};
-            const hasPhotoURL = profile.photoURL || userData.photoURL;
-            
-            // If user cache doesn't have photoURL, check admin cache
-            if (!hasPhotoURL) {
-                const adminCacheRef = ref(rtdb, 'adminCache/participants');
-                const adminCacheSnap = await get(adminCacheRef);
-                
-                if (adminCacheSnap.exists()) {
-                    const cache = adminCacheSnap.val();
-                    const activeUsers = cache.active || [];
-                    const userInCache = activeUsers.find(p => p.id === uid);
-                    
-                    if (userInCache && userInCache.photoURL) {
-                        // Found photoURL in admin cache, sync to user cache
-                        const profileUpdate = {...profile};
-                        profileUpdate.photoURL = userInCache.photoURL;
-                        await update(ref(rtdb, `users/${uid}`), {
-                            profile: profileUpdate
-                        });
-                    }
-                }
-            }
-        }
-    } catch (error) {
-        // Non-critical, continue
-    }
-}
-
 // Update user document with Firebase auth data on login
 async function updateUserOnLogin(user) {
     try {
-        const userRef = doc(db, 'users', user.uid);
-        const userSnap = await getDoc(userRef);
-        
-        // Check if user exists in Firestore
-        if (userSnap.exists()) {
-            const userData = userSnap.data();
-            const updateData = {};
-            
-            // Always update displayName and photoURL if available from auth
-            if (user.displayName) {
-                updateData.displayName = user.displayName;
-            }
-            if (user.photoURL) {
-                updateData.photoURL = user.photoURL;
-            }
-            
-            // Set firstLoginAt if not exists, otherwise update lastLoginAt
-            if (!userData.firstLoginAt) {
-                updateData.firstLoginAt = serverTimestamp();
-            } else {
-                updateData.lastLoginAt = serverTimestamp();
-            }
-            
-            if (Object.keys(updateData).length > 0) {
-                await updateDoc(userRef, updateData);
-            }
-        }
-        // If user doesn't exist in Firestore, they might be admin-only
-        // Still update RTDB if they exist there (admin users can also be participants)
+        // Update RTDB immediately (RTDB-first architecture)
+        // Firestore backup is handled by hourlyFirestoreBackup Cloud Function
         
         // Always update RTDB immediately if user exists (for both regular and admin users)
         // RTDB triggers will automatically update admin cache in real-time
@@ -699,10 +576,10 @@ async function updateUserOnLogin(user) {
                         const profileUpdate = {
                             ...currentProfile
                         };
-                        if (user.displayName) {
+        if (user.displayName) {
                             profileUpdate.displayName = user.displayName;
-                        }
-                        if (user.photoURL) {
+        }
+        if (user.photoURL) {
                             profileUpdate.photoURL = user.photoURL;
                         }
                         
@@ -1023,48 +900,11 @@ async function loadUserProfile() {
             
             // Update UI
             const profile = userData.profile || {};
-            // Handle backward compatibility: check both profile.photoURL and root-level photoURL
-            // Also check currentUser.photoURL from Firebase Auth
-            let photoURL = profile.photoURL || userData.photoURL || null;
-            
-            // If no photoURL in RTDB, try multiple sources:
-            // 1. Firebase Auth
-            // 2. Admin cache (if available)
-            if (!photoURL) {
-                // Try Firebase Auth first
-                if (currentUser && currentUser.photoURL) {
-                    photoURL = currentUser.photoURL;
-                } else {
-                    // Try admin cache as fallback
-                    try {
-                        const adminCacheRef = ref(rtdb, 'adminCache/participants');
-                        const adminCacheSnap = await get(adminCacheRef);
-                        if (adminCacheSnap.exists()) {
-                            const cache = adminCacheSnap.val();
-                            const activeUsers = cache.active || [];
-                            const userInCache = activeUsers.find(p => p.id === currentUser.uid);
-                            if (userInCache && userInCache.photoURL) {
-                                photoURL = userInCache.photoURL;
-                            }
-                        }
-                    } catch (cacheError) {
-                        // Admin cache read failed, continue
-                    }
-                }
-                
-                // If we found a photoURL from any source, update RTDB
-                if (photoURL) {
-                    try {
-                        const profileUpdate = {...profile};
-                        profileUpdate.photoURL = photoURL;
-                        await update(ref(rtdb, `users/${currentUser.uid}`), {
-                            profile: profileUpdate
-                        });
-                    } catch (updateError) {
-                        // Non-critical, continue
-                    }
-                }
-            }
+            // Get photoURL - read-only (no syncing)
+            // RTDB triggers handle photoURL syncing from Firebase Auth
+            // Fallback to currentUser.photoURL for display only (doesn't update RTDB)
+            let photoURL = profile.photoURL || userData.photoURL || 
+                          (currentUser && currentUser.photoURL) || null;
             
             document.getElementById('user-name').textContent = profile.fullName || profile.displayName || userData.fullName || userData.displayName || 'User';
             document.getElementById('user-email').textContent = (profile.district || userData.district) ? `RI District ${profile.district || userData.district}` : 'N/A';
@@ -2450,47 +2290,11 @@ async function loadCurrentUserFooter(leaderboardParticipants) {
         const profile = userData.profile || {};
         const initials = (profile.fullName || profile.displayName || 'U').split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
         
-        // Get photoURL - check RTDB first, then Firebase Auth, then admin cache
-        let photoURL = profile.photoURL || userData.photoURL || null;
-        
-        // If no photoURL in RTDB, try multiple sources:
-        // 1. Firebase Auth
-        // 2. Admin cache (if available)
-        if (!photoURL) {
-            // Try Firebase Auth first
-            if (currentUser && currentUser.photoURL) {
-                photoURL = currentUser.photoURL;
-            } else {
-                // Try admin cache as fallback
-                try {
-                    const adminCacheRef = ref(rtdb, 'adminCache/participants');
-                    const adminCacheSnap = await get(adminCacheRef);
-                    if (adminCacheSnap.exists()) {
-                        const cache = adminCacheSnap.val();
-                        const activeUsers = cache.active || [];
-                        const userInCache = activeUsers.find(p => p.id === currentUser.uid);
-                        if (userInCache && userInCache.photoURL) {
-                            photoURL = userInCache.photoURL;
-                        }
-                    }
-                } catch (cacheError) {
-                    // Admin cache read failed, continue
-                }
-            }
-            
-            // If we found a photoURL from any source, update RTDB
-            if (photoURL) {
-                try {
-                    const profileUpdate = {...profile};
-                    profileUpdate.photoURL = photoURL;
-                    await update(ref(rtdb, `users/${currentUser.uid}`), {
-                        profile: profileUpdate
-                    });
-                } catch (updateError) {
-                    // Non-critical, continue
-                }
-            }
-        }
+        // Get photoURL - read-only (no syncing)
+        // RTDB triggers handle photoURL syncing from Firebase Auth
+        // Fallback to currentUser.photoURL for display only (doesn't update RTDB)
+        const photoURL = profile.photoURL || userData.photoURL || 
+                        (currentUser && currentUser.photoURL) || null;
         const footer = document.getElementById('current-user-footer');
         if (!footer) return;
         
