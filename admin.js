@@ -690,37 +690,8 @@ document.getElementById('add-participant-form').addEventListener('submit', async
             profession: profession
         });
         
-        if (btnText) {
-            btnText.textContent = 'Updating cache...';
-        } else {
-            submitButton.textContent = 'Updating cache...';
-        }
-        
-        // Update admin cache incrementally
-        try {
-            const functions = getFunctions();
-            const updateAdminCacheIncremental = httpsCallable(functions, 'updateAdminCacheIncremental');
-            
-            const pendingUserRef = ref(rtdb, `pendingUsers/${encodedEmail}`);
-            const pendingSnap = await get(pendingUserRef);
-            
-            if (pendingSnap.exists()) {
-                const userData = pendingSnap.val();
-                await updateAdminCacheIncremental({
-                    uid: encodedEmail,
-                    type: 'pending',
-                    userData: userData
-                });
-            }
-        } catch (cacheError) {
-            // Non-critical - cache will be updated on next refresh
-        }
-        
-        if (btnText) {
-            btnText.textContent = 'Saving...';
-        } else {
-            submitButton.textContent = 'Saving...';
-        }
+        // RTDB triggers (onPendingUserCreated) will automatically update admin cache
+        // No need for client-side cache updates - triggers handle this
         
         showAlert('Success', 'Participant added successfully!', 'success');
         
@@ -728,8 +699,10 @@ document.getElementById('add-participant-form').addEventListener('submit', async
         document.getElementById('add-participant-form').reset();
         
         // Reload participants list if on manage tab
+        // Wait a bit for RTDB triggers to process before refreshing
         if (currentTab === 'manage') {
-            // Force reload from RTDB (bypass cache) to show new participant immediately
+            // Wait for RTDB triggers to process (they run asynchronously)
+            await new Promise(resolve => setTimeout(resolve, 1000));
             await loadParticipants(true);
         }
         
@@ -1041,39 +1014,8 @@ async function bulkImportParticipants(participants) {
         }
     }
     
-    // Update admin cache incrementally for all successfully imported participants
-    if (results.success.length > 0) {
-        try {
-            const functions = getFunctions();
-            const updateAdminCacheIncremental = httpsCallable(functions, 'updateAdminCacheIncremental');
-            
-            // Update cache for each successful participant
-            const updatePromises = results.success.map(async (result) => {
-                const participant = result.participant;
-                const email = participant.Email.trim().toLowerCase();
-                const normalizedEmail = normalizeEmail(email);
-                const encodedEmail = encodeEmailForPath(normalizedEmail);
-                
-                // Get the participant data from RTDB
-                const pendingUserRef = ref(rtdb, `pendingUsers/${encodedEmail}`);
-                const pendingSnap = await get(pendingUserRef);
-                
-                if (pendingSnap.exists()) {
-                    const userData = pendingSnap.val();
-                    await updateAdminCacheIncremental({
-                        uid: encodedEmail,
-                        type: 'pending',
-                        userData: userData
-                    });
-                }
-            });
-            
-            // Wait for all cache updates (but don't fail if some fail)
-            await Promise.allSettled(updatePromises);
-        } catch (cacheError) {
-            // Non-critical - cache will be updated on next refresh or when stale
-        }
-    }
+    // RTDB triggers (onPendingUserCreated) will automatically update admin cache
+    // No need for client-side cache updates - triggers handle this
     
     // Show results
     progressDiv.classList.add('hidden');
@@ -1092,8 +1034,11 @@ async function bulkImportParticipants(participants) {
     
     resultsText.textContent = resultsMessage;
     
-    // Reload participants if on manage tab (force refresh to show new participants)
+    // Reload participants if on manage tab
+    // Wait a bit for RTDB triggers to process before refreshing
     if (currentTab === 'manage') {
+        // Wait for RTDB triggers to process (they run asynchronously)
+        await new Promise(resolve => setTimeout(resolve, 1500));
         await loadParticipants(true);
     }
     
@@ -1460,7 +1405,8 @@ async function loadParticipants(forceRefresh = false) {
                             return {
                                 ...user,
                                 identifier: identifier || user.id, // Use encoded email as identifier
-                                type: 'pending'
+                                type: 'pending',
+                                rank: user.rank || 'Rookie' // Ensure rank defaults to 'Rookie' for pending users
                             };
                         });
                         
@@ -1511,6 +1457,8 @@ async function loadParticipants(forceRefresh = false) {
                         identifier: child.key, // encoded email (for delete/view operations)
                         email: data.email || decodeEmailFromPath(child.key), // actual email
                         sortDate: data.createdAt || 0,
+                        rank: data.rank || 'Rookie', // Default to 'Rookie' for pending users
+                        score: data.score || 0,
                         ...data
                     });
                 });
