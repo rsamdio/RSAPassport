@@ -53,97 +53,271 @@ function calculateRank(score) {
 }
 
 /**
- * Batch process pending scores every 5 minutes
- * Aggregates all score changes and processes them together
+ * Idempotent batch processing with catch-all for offline batches
+ * Processes current batch + any expired batches (offline scans)
+ * Fixes: Double-count race condition (C2) and Offline scan loss (C3)
  */
 exports.batchProcessScores = onSchedule(
     {
       schedule: "every 5 minutes",
       timeZone: "UTC",
       region: region,
+      timeoutSeconds: 540, // 9 minutes (allow time for catch-up)
     },
     async (event) => {
-      const batchId = getCurrentBatchId();
-      const pendingScoresRef = rtdb.ref(`pendingScores/${batchId}`);
-      const pendingScoresSnap = await pendingScoresRef.once("value");
+      const currentBatchId = getCurrentBatchId();
+      const processedBatches = new Set();
 
-      if (!pendingScoresSnap.exists()) {
-        return {message: "No pending scores to process"};
+      try {
+        // 1. Process current batch first (most common case)
+        const currentResult = await processBatchIdempotent(currentBatchId);
+        if (currentResult.processed) {
+          processedBatches.add(currentBatchId);
+        }
+
+        // 2. Catch-up: Process any expired batches (offline scans)
+        // Look for batches from last 2 hours (24 batches = 2 hours)
+        const expiredBatches = await findExpiredBatches(24);
+
+        for (const batchId of expiredBatches) {
+          if (batchId === currentBatchId) continue; // Already processed
+
+          const result = await processBatchIdempotent(batchId);
+          if (result.processed) {
+            processedBatches.add(batchId);
+          }
+        }
+
+        return {
+          processedBatches: Array.from(processedBatches),
+          totalProcessed: processedBatches.size,
+        };
+      } catch (error) {
+        console.error("Batch processing error:", error);
+        // Don't throw - let scheduler retry
+        return {error: error.message};
       }
+    },
+);
 
-      const pendingScores = pendingScoresSnap.val();
-      const scoreUpdates = {};
-      const affectedUids = new Set();
+/**
+ * Idempotent batch processing - safe to retry
+ * Uses processing lock to prevent double-counting
+ * @param {string} batchId - The batch ID to process
+ */
+async function processBatchIdempotent(batchId) {
+  const pendingScoresRef = rtdb.ref(`pendingScores/${batchId}`);
+  const lockRef = rtdb.ref(`pendingScores/${batchId}/_processing`);
 
-      // Aggregate score changes
-      for (const [uid, scoreData] of Object.entries(pendingScores)) {
-        const delta = scoreData.delta || 0;
-        if (delta === 0) continue;
+  try {
+    // 1. Check if batch exists
+    const pendingScoresSnap = await pendingScoresRef.once("value");
+    if (!pendingScoresSnap.exists()) {
+      return {processed: false, message: "Batch does not exist"};
+    }
 
-        // Get current user data
+    // 2. Check processing lock (idempotency check)
+    const lockSnap = await lockRef.once("value");
+    if (lockSnap.exists()) {
+      const lockData = lockSnap.val();
+      const lockTime = lockData.timestamp || 0;
+      const lockAge = Date.now() - lockTime;
+
+      // If lock is older than 10 minutes, assume previous process crashed
+      // Release lock and continue
+      if (lockAge > 600000) {
+        console.warn(
+            `Stale lock detected for batch ${batchId}, age: ${lockAge}ms`,
+        );
+        await lockRef.remove();
+      } else {
+        // Lock is fresh, another process is handling this batch
+        return {processed: false, message: "Batch is being processed"};
+      }
+    }
+
+    // 3. Acquire processing lock (atomic using transaction)
+    const lockData = {
+      timestamp: Date.now(),
+      processId: `${Date.now()}-${Math.random()}`,
+    };
+
+    // Use transaction to atomically acquire lock
+    const transactionResult = await lockRef.transaction((current) => {
+      if (current === null) {
+        return lockData;
+      }
+      // Lock already exists, abort transaction
+      return; // undefined = abort
+    });
+
+    // Check if transaction succeeded
+    if (!transactionResult.committed) {
+      // Another process got the lock
+      return {processed: false, message: "Could not acquire lock"};
+    }
+
+    // Verify lock was acquired with our processId
+    const verifyLock = await lockRef.once("value");
+    const lockProcessId = verifyLock.val()?.processId;
+    if (!verifyLock.exists() || lockProcessId !== lockData.processId) {
+      // Another process got the lock
+      return {processed: false, message: "Could not acquire lock"};
+    }
+
+    // 4. Read pending scores (with lock held)
+    const pendingScores = pendingScoresSnap.val();
+    const scoreUpdates = {};
+    const affectedUids = new Set();
+
+    // 5. Aggregate score changes (idempotent: read current score, add delta)
+    for (const [uid, scoreData] of Object.entries(pendingScores)) {
+      // Skip lock entry
+      if (uid === "_processing") continue;
+
+      const delta = scoreData.delta || 0;
+      if (delta === 0) continue;
+
+      // Get current user score (lightweight read - optimization)
+      // Use users_scores if available, fallback to users
+      let currentScore = 0;
+      let lastProcessedBatch = {};
+      const scoreRef = rtdb.ref(`users_scores/${uid}`);
+      const scoreSnap = await scoreRef.once("value");
+
+      if (scoreSnap.exists()) {
+        const scoreData = scoreSnap.val();
+        currentScore = scoreData.score || 0;
+        // Note: _lastProcessedBatch is stored in users/{uid}, not users_scores
+      } else {
+        // Fallback: read from users (for backward compatibility)
         const userRef = rtdb.ref(`users/${uid}`);
         const userSnap = await userRef.once("value");
 
-        if (!userSnap.exists()) continue;
+        if (!userSnap.exists()) {
+          continue;
+        }
 
         const userData = userSnap.val();
-        const currentScore = userData.score || 0;
-        const newScore = currentScore + delta;
-        const newRank = calculateRank(newScore);
-
-        // Update user score and rank
-        scoreUpdates[`users/${uid}/score`] = newScore;
-        scoreUpdates[`users/${uid}/rank`] = newRank;
-
-        affectedUids.add(uid);
+        currentScore = userData.score || 0;
+        lastProcessedBatch = userData._lastProcessedBatch || {};
       }
 
-      // Batch update all scores
-      if (Object.keys(scoreUpdates).length > 0) {
-        await rtdb.ref().update(scoreUpdates);
+      // Get _lastProcessedBatch from users/{uid} (always stored there)
+      const userRef = rtdb.ref(`users/${uid}`);
+      const userSnap = await userRef.once("value");
+      if (userSnap.exists()) {
+        const userData = userSnap.val();
+        lastProcessedBatch = userData._lastProcessedBatch || {};
       }
 
-      // Update sorted score index (for efficient rank/leaderboard queries)
-      // Include all affected users in the index
-      if (affectedUids.size > 0) {
-        await updateSortedScoreIndex(Array.from(affectedUids));
+      // IDEMPOTENCY: Check if this batch was already processed for this user
+
+      if (lastProcessedBatch[batchId] === true) {
+        // This batch was already processed for this user
+        continue;
       }
 
-      // Incremental rank updates (only affected users) - uses sorted index
-      if (affectedUids.size > 0) {
-        await updateRanksIncremental(Array.from(affectedUids));
-      } else {
-        // If no affected users but we processed scores, update all ranks
-        // This handles edge cases where index might be out of sync
-        const usersRef = rtdb.ref("users");
-        const usersSnap = await usersRef.once("value");
-        const allUids = [];
-        usersSnap.forEach((child) => {
-          allUids.push(child.key);
-        });
-        if (allUids.length > 0) {
-          await updateRanksIncremental(allUids);
-        }
-      }
+      // Calculate new score
+      const newScore = currentScore + delta;
+      const newRank = calculateRank(newScore);
 
-      // Incremental leaderboard updates - uses sorted index
-      if (affectedUids.size > 0) {
-        await updateLeaderboardIncremental(Array.from(affectedUids));
-      }
-
-      // Cleanup pending scores
-      await pendingScoresRef.remove();
-
-      // Cleanup pending scans
-      const pendingScansRef = rtdb.ref(`scans/pending/${batchId}`);
-      await pendingScansRef.remove();
-
-      return {
-        processed: Object.keys(pendingScores).length,
-        scoreUpdates: Object.keys(scoreUpdates).length,
+      // Mark this batch as processed for this user
+      const updatedLastProcessed = {
+        ...lastProcessedBatch,
+        [batchId]: true,
       };
-    },
-);
+
+      // Update user score, rank, and processing marker
+      // Update both users (backward compat) and users_scores (optimized)
+      scoreUpdates[`users/${uid}/score`] = newScore;
+      scoreUpdates[`users/${uid}/rank`] = newRank;
+      scoreUpdates[`users/${uid}/_lastProcessedBatch`] = updatedLastProcessed;
+      // Also update users_scores (lightweight path for future reads)
+      scoreUpdates[`users_scores/${uid}/score`] = newScore;
+      scoreUpdates[`users_scores/${uid}/rank`] = newRank;
+      scoreUpdates[`users_scores/${uid}/lastUpdated`] = Date.now();
+
+      affectedUids.add(uid);
+    }
+
+    // 6. Batch update all scores (atomic)
+    if (Object.keys(scoreUpdates).length > 0) {
+      await rtdb.ref().update(scoreUpdates);
+    }
+
+    // 7. Update indexes and caches
+    if (affectedUids.size > 0) {
+      await updateSortedScoreIndex(Array.from(affectedUids));
+      await updateRanksIncremental(Array.from(affectedUids));
+      await updateLeaderboardIncremental(Array.from(affectedUids));
+    }
+
+    // 8. Delete batch and lock (atomic - both or neither)
+    await rtdb.ref().update({
+      [`pendingScores/${batchId}`]: null,
+    });
+
+    return {
+      processed: true,
+      processedUsers: affectedUids.size,
+      batchId: batchId,
+    };
+  } catch (error) {
+    // Release lock on error
+    try {
+      await lockRef.remove();
+    } catch (lockError) {
+      // Ignore lock release errors
+    }
+
+    throw error;
+  }
+}
+
+/**
+ * Find expired batches that need processing (offline scans)
+ * Returns array of batch IDs from last N batches
+ * @param {number} lookbackBatches - Number of batches to look back
+ */
+async function findExpiredBatches(lookbackBatches = 24) {
+  const expiredBatches = [];
+  const now = new Date();
+
+  // Generate batch IDs for last N batches (5-minute intervals)
+  for (let i = 1; i <= lookbackBatches; i++) {
+    const batchDate = new Date(now.getTime() - (i * 5 * 60 * 1000));
+    const minutes = Math.floor(batchDate.getMinutes() / 5) * 5;
+    const batchDateRounded = new Date(
+        batchDate.getFullYear(),
+        batchDate.getMonth(),
+        batchDate.getDate(),
+        batchDate.getHours(),
+        minutes,
+    );
+    const batchId = batchDateRounded.toISOString()
+        .slice(0, 16)
+        .replace("T", "-");
+
+    // Check if batch exists and has pending scores
+    const batchRef = rtdb.ref(`pendingScores/${batchId}`);
+    const batchSnap = await batchRef.once("value");
+
+    if (batchSnap.exists()) {
+      const batchData = batchSnap.val();
+      // Check if batch has actual scores (not just lock)
+      const hasScores = Object.keys(batchData).some((key) =>
+        key !== "_processing" && batchData[key] && batchData[key].delta,
+      );
+
+      if (hasScores) {
+        expiredBatches.push(batchId);
+      }
+    }
+  }
+
+  return expiredBatches;
+}
 
 /**
  * Update sorted score index for efficient queries
@@ -302,6 +476,11 @@ async function updateRanksIncremental(affectedUids) {
 async function updateLeaderboardIncremental(affectedUids) {
   // Get sorted score index (much faster than reading all users)
   const indexRef = rtdb.ref("indexes/sortedScores");
+
+  // Try to use query to get only top 10 (optimization)
+  // Note: RTDB queries on arrays require the array to be stored as an object
+  // Since sortedScores is an array, we'll read it and slice client-side
+  // For future optimization, consider restructuring sortedScores as an object
   const indexSnap = await indexRef.once("value");
 
   if (!indexSnap.exists()) {
@@ -311,6 +490,7 @@ async function updateLeaderboardIncremental(affectedUids) {
   }
 
   const sortedIndex = indexSnap.val() || [];
+  // Get top 10 (most efficient - only processes first 10 entries)
   const top10Index = sortedIndex.slice(0, 10);
 
   // Get user details for top 10 only (much fewer reads)
@@ -998,6 +1178,19 @@ exports.onUserCreated = onValueCreated(
           profile: profile,
         };
 
+        // Create users_scores entry (lightweight path for score reads)
+        const score = userData.score || 0;
+        const rank = userData.rank || calculateRank(score);
+        try {
+          await rtdb.ref(`users_scores/${uid}`).set({
+            score: score,
+            rank: rank,
+            lastUpdated: Date.now(),
+          });
+        } catch (scoreError) {
+          // Non-critical, continue
+        }
+
         // Add user to active cache
         await updateAdminCacheIncremental(uid, "active", updatedUserData);
 
@@ -1084,6 +1277,19 @@ exports.onUserUpdated = onValueUpdated(
           ...userData,
           profile: profile,
         };
+
+        // Update users_scores entry (lightweight path for score reads)
+        const score = userData.score || 0;
+        const rank = userData.rank || calculateRank(score);
+        try {
+          await rtdb.ref(`users_scores/${uid}`).update({
+            score: score,
+            rank: rank,
+            lastUpdated: Date.now(),
+          });
+        } catch (scoreError) {
+          // Non-critical, continue
+        }
 
         // Update admin cache
         await updateAdminCacheIncremental(uid, "active", updatedUserData);

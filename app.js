@@ -25,7 +25,7 @@ import {
     setDoc, 
     updateDoc, 
     collection, 
-    query, 
+    query as firestoreQuery, 
     where,
     orderBy, 
     limit, 
@@ -43,7 +43,14 @@ import {
     get, 
     set,
     update,
-    remove
+    remove,
+    query,
+    orderByKey,
+    orderByChild,
+    limitToLast,
+    limitToFirst,
+    startAt,
+    endAt
 } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js';
 import { deleteDoc } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js';
 import { 
@@ -148,6 +155,9 @@ onAuthStateChanged(auth, async (user) => {
         // Update localStorage cache
         await updateRTDBUserData(user);
         
+        // Validate and fix stale QR codes (Zombie Token fix)
+        await validateLocalSession();
+        
         await loadUserProfile();
         showView('passport');
     } else {
@@ -155,6 +165,146 @@ onAuthStateChanged(auth, async (user) => {
         showView('login');
     }
 });
+
+/**
+ * Validates that the displayed QR code matches the current token in RTDB
+ * Auto-heals stale QR codes by regenerating from current token
+ * Fixes: Zombie Token Bug (C1)
+ */
+async function validateLocalSession() {
+    if (!currentUser) return;
+    
+    const uid = currentUser.uid;
+    
+    try {
+        // 1. Get current qrToken from RTDB (source of truth)
+        const userRef = ref(rtdb, `users/${uid}`);
+        const userSnap = await get(userRef);
+        
+        if (!userSnap.exists()) {
+            // User doesn't exist, clear all cache
+            clearAllLocalCache(uid);
+            return;
+        }
+        
+        const userData = userSnap.val();
+        const currentToken = userData.qrToken;
+        
+        if (!currentToken) {
+            return;
+        }
+        
+        // 2. Check localStorage cache for stored token
+        const cacheKey = `user_${uid}_qr`;
+        const cachedQR = localStorage.getItem(cacheKey);
+        
+        let cachedToken = null;
+        if (cachedQR) {
+            try {
+                const parsed = JSON.parse(cachedQR);
+                cachedToken = parsed.token || parsed.qrToken;
+            } catch (e) {
+                // Invalid cache, clear it
+                localStorage.removeItem(cacheKey);
+            }
+        }
+        
+        // 3. Validate token matches
+        if (cachedToken && cachedToken !== currentToken) {
+            // STALE TOKEN DETECTED - Auto-heal
+            // Clear stale QR code cache
+            localStorage.removeItem(cacheKey);
+            
+            // Regenerate QR code with current token
+            const canvas = document.getElementById('qr-code-canvas');
+            if (canvas) {
+                await generateQRCode(currentToken);
+            }
+            
+            // Also clear any other stale caches
+            clearStaleCaches(uid, currentToken);
+        }
+        
+        // 4. Validate QR code in RTDB exists and matches
+        const qrCodeRef = ref(rtdb, `qrcodes/${currentToken}`);
+        const qrCodeSnap = await get(qrCodeRef);
+        
+        if (!qrCodeSnap.exists()) {
+            // QR code missing - recreate it
+            try {
+                const qrCodeData = {
+                    uid: uid,
+                    name: userData.profile?.fullName || userData.profile?.displayName || 'User',
+                    photo: userData.profile?.photoURL || null,
+                    email: userData.email || null,
+                    district: userData.profile?.district || null,
+                    phone: userData.profile?.phone || null,
+                    profession: userData.profile?.profession || null,
+                };
+                
+                await set(qrCodeRef, qrCodeData);
+            } catch (recreateError) {
+                // Failed to recreate QR code - non-critical
+            }
+        } else {
+            // Validate QR code UID matches current user
+            const qrCodeData = qrCodeSnap.val();
+            if (qrCodeData.uid !== uid) {
+                // Update QR code with correct UID (handles migration edge case)
+                try {
+                    await update(qrCodeRef, { uid: uid });
+                } catch (updateError) {
+                    // Failed to update QR code UID - non-critical
+                }
+            }
+        }
+        
+        // 5. Update cache with current token (for future validation)
+        try {
+            localStorage.setItem(cacheKey, JSON.stringify({
+                token: currentToken,
+                timestamp: Date.now(),
+                validated: true
+            }));
+        } catch (e) {
+            // localStorage might be disabled
+        }
+        
+    } catch (error) {
+        // Error validating local session - non-critical, continue with app
+    }
+}
+
+/**
+ * Clears all stale caches for a user
+ */
+function clearStaleCaches(uid, currentToken) {
+    try {
+        // Clear QR code cache
+        localStorage.removeItem(`user_${uid}_qr`);
+        
+        // Clear user data cache (might have stale score/rank)
+        localStorage.removeItem(`user_${uid}_data`);
+        
+        // Note: We keep recentConnections cache as it's less critical
+    } catch (e) {
+        // localStorage might be disabled
+    }
+}
+
+/**
+ * Clears all local cache for a user (used on logout/deletion)
+ */
+function clearAllLocalCache(uid) {
+    try {
+        localStorage.removeItem(`user_${uid}_qr`);
+        localStorage.removeItem(`user_${uid}_data`);
+        localStorage.removeItem(`user_${uid}_recentConnections`);
+        localStorage.removeItem(`leaderboardRank_${uid}`);
+    } catch (e) {
+        // localStorage might be disabled
+    }
+}
 
 // Update localStorage cache with user data
 // Note: RTDB updates are handled automatically by Cloud Functions
@@ -263,7 +413,7 @@ async function checkIfParticipant(uid, email) {
         
         // Fallback: Check Firestore pendingUsers (for backward compatibility)
         const pendingUsersRef = collection(db, 'pendingUsers');
-        const emailQuery = query(pendingUsersRef, where('email', '==', normalizedEmail));
+        const emailQuery = firestoreQuery(pendingUsersRef, where('email', '==', normalizedEmail));
         let querySnapshot;
         
         try {
@@ -365,7 +515,6 @@ async function migratePendingUser(uid, normalizedEmail, pendingData) {
         };
         
         // Update user in RTDB
-        // QR code will be created/updated by onUserCreated RTDB trigger
         await set(userRTDBRef, {
             email: normalizedEmail,
             participantId: pendingData.participantId || null,
@@ -378,8 +527,38 @@ async function migratePendingUser(uid, normalizedEmail, pendingData) {
             lastLoginAt: Date.now(),
         });
         
+        // Create users_scores entry (lightweight path for score reads - optimization)
+        try {
+            await set(ref(rtdb, `users_scores/${uid}`), {
+                score: 0,
+                rank: initialRank,
+                lastUpdated: Date.now(),
+            });
+        } catch (scoreError) {
+            // Non-critical, continue
+        }
+        
+        // Immediately update QR code with correct UID (don't wait for trigger)
+        // This fixes race condition where QR code might be scanned before onUserCreated completes
+        // The QR code currently has uid: encodedEmail, but should have uid: uid
+        try {
+            const qrCodeRef = ref(rtdb, `qrcodes/${qrToken}`);
+            
+            await update(qrCodeRef, {
+                uid: uid,
+                name: profile.fullName || profile.displayName || pendingData.fullName || "User",
+                photo: authPhotoURL || null,
+                email: normalizedEmail,
+                district: profile.district || pendingData.district || null,
+                phone: profile.phone || pendingData.phone || null,
+                profession: profile.profession || pendingData.profession || null,
+            });
+        } catch (qrUpdateError) {
+            // Non-critical - onUserCreated trigger will handle it
+        }
+        
         // onUserCreated RTDB trigger will handle:
-        // - QR code creation/update
+        // - QR code creation/update (if not already done above)
         // - PhotoURL syncing from Firebase Auth (if missing)
         // - Admin cache updates
         // - Rank calculation
@@ -634,24 +813,50 @@ async function calculateRankFromRTDB(score) {
 async function updateRecentScansCache(scannerUid, scannedUid, qrData) {
     try {
         const recentRef = ref(rtdb, `scans/recent/${scannerUid}`);
-        const recentSnap = await get(recentRef);
-        const recent = recentSnap.val() || [];
+        const scanTimestamp = Date.now();
+        const scanKey = `${scanTimestamp}_${scannedUid}`; // Unique key for pagination
         
-        recent.unshift({
-            scannedUid: scannedUid,
-            name: qrData.name,
-            photo: qrData.photo,
-            district: qrData.district,
-            email: qrData.email || null,
-            phone: qrData.phone || null,
-            profession: qrData.profession || null,
-            scannedAt: Date.now()
+        // Use object structure instead of array for efficient querying
+        await update(recentRef, {
+            [scanKey]: {
+                scannedUid: scannedUid,
+                name: qrData.name || null,
+                photo: qrData.photo || null,
+                district: qrData.district || null,
+                email: qrData.email || null,
+                phone: qrData.phone || null,
+                profession: qrData.profession || null,
+                scannedAt: scanTimestamp
+            }
         });
         
-        // Keep only last 10
-        await set(recentRef, recent.slice(0, 10));
+        // Optional: Cleanup old entries (keep last 500)
+        // This prevents unbounded growth
+        const recentSnap = await get(recentRef);
+        if (recentSnap.exists()) {
+            const recent = recentSnap.val();
+            // Handle both array (legacy) and object (new) formats
+            let entries;
+            if (Array.isArray(recent)) {
+                // Legacy format - convert to object
+                entries = recent.map((conn, idx) => [`${conn.scannedAt || Date.now()}_${conn.scannedUid}_${idx}`, conn]);
+            } else {
+                entries = Object.entries(recent);
+            }
+            
+            if (entries.length > 500) {
+                // Sort by timestamp, keep newest 500
+                entries.sort((a, b) => (b[1].scannedAt || 0) - (a[1].scannedAt || 0));
+                const toKeep = entries.slice(0, 500);
+                const cleanup = {};
+                toKeep.forEach(([key, value]) => {
+                    cleanup[key] = value;
+                });
+                await set(recentRef, cleanup);
+            }
+        }
     } catch (error) {
-        // Non-critical, ignore
+        // Error updating recent scans cache - non-critical, ignore
     }
 }
 
@@ -863,6 +1068,9 @@ async function loadUserProfile() {
                 displayQRCodeFromDatabase(cachedQRCode);
             }
         }
+        
+        // Validate session before loading profile (fixes zombie token)
+        await validateLocalSession();
         
         // Get user data from RTDB (primary source) - always fetch for freshness
         const userRef = ref(rtdb, `users/${currentUser.uid}`);
@@ -1627,39 +1835,75 @@ async function processScan(qrToken) {
             throw new Error('Invalid QR code data');
         }
         
-        const targetUid = targetData.uid;
+        let targetUid = targetData.uid;
         
-        // Validate targetUid format (should be a valid uid, not encoded email)
-        // If it's an encoded email (contains underscores), it means user hasn't migrated yet
-        if (targetUid.includes('_') && targetUid.length > 20) {
-            // This is likely an encoded email - user hasn't logged in yet
-            throw new Error('User has not completed registration yet');
-        }
-        
-        // Step 2: Check if scanning self
-        if (targetUid === scannerUid) {
-            throw new Error("You can't scan your own QR code!");
-        }
+        // Step 2: Check if scanning self (before resolving encoded email)
+        // If targetUid is an encoded email, we'll resolve it first, then check self-scan
+        let isEncodedEmail = targetUid.includes('_') && targetUid.length > 20;
         
         // Step 3: Verify target user exists in users collection
         // This handles race conditions where QR code is updated but user migration isn't complete
-        const targetUserRef = ref(rtdb, `users/${targetUid}`);
-        const targetUserSnap = await get(targetUserRef);
+        let targetUserRef = ref(rtdb, `users/${targetUid}`);
+        let targetUserSnap = await get(targetUserRef);
         
         if (!targetUserSnap.exists()) {
-            // User might be in pending state - check if uid is actually an encoded email
-            const encodedEmail = targetUid;
-            const pendingUserRef = ref(rtdb, `pendingUsers/${encodedEmail}`);
-            const pendingUserSnap = await get(pendingUserRef);
+            // Check if uid is actually an encoded email (user hasn't migrated yet)
+            if (isEncodedEmail) {
+                const encodedEmail = targetUid;
+                const pendingUserRef = ref(rtdb, `pendingUsers/${encodedEmail}`);
+                const pendingUserSnap = await get(pendingUserRef);
+                
+                if (pendingUserSnap.exists()) {
+                    throw new Error('User has not completed registration yet');
+                }
+            }
             
-            if (pendingUserSnap.exists()) {
-                throw new Error('User has not completed registration yet');
-            } else {
+            // If QR code has encoded email but user has migrated, try to find user by email
+            // This handles race condition where QR code wasn't updated yet after migration
+            if (isEncodedEmail && targetData.email) {
+                // Try to find user by email using the email index
+                const emailIndexRef = ref(rtdb, `indexes/emails/${encodeEmailForPath(targetData.email)}`);
+                const emailIndexSnap = await get(emailIndexRef);
+                
+                if (emailIndexSnap.exists()) {
+                    const indexData = emailIndexSnap.val();
+                    const actualUid = indexData.uid;
+                    
+                    // If index points to a UID (not encoded email), user has migrated
+                    if (actualUid && !actualUid.includes('_')) {
+                        // User exists in users collection with this UID
+                        targetUserRef = ref(rtdb, `users/${actualUid}`);
+                        targetUserSnap = await get(targetUserRef);
+                        
+                        if (targetUserSnap.exists()) {
+                            // Update QR code with correct UID to fix it for future scans
+                            try {
+                                await update(ref(rtdb, `qrcodes/${qrToken}`), {
+                                    uid: actualUid
+                                });
+                            } catch (updateError) {
+                                // Non-critical - continue with scan
+                            }
+                            
+                            // Use the actual UID for the rest of the scan
+                            targetUid = actualUid;
+                        }
+                    }
+                }
+            }
+            
+            // If still not found, throw error
+            if (!targetUserSnap.exists()) {
                 throw new Error('Target user not found');
             }
         }
         
-        // Step 4: Check duplicate from RTDB (1 read)
+        // Step 4: Check if scanning self (after resolving encoded email to actual UID)
+        if (targetUid === scannerUid) {
+            throw new Error("You can't scan your own QR code!");
+        }
+        
+        // Step 5: Check duplicate scan (handle both UID formats for migration)
         const scanCheckRef = ref(rtdb, `scans/byScanner/${scannerUid}/${targetUid}`);
         const scanCheck = await get(scanCheckRef);
         
@@ -1667,7 +1911,47 @@ async function processScan(qrToken) {
             throw new Error('ALREADY_SCANNED');
         }
         
-        // Step 5: Get current user data from RTDB
+        // Also check encoded email if we resolved UID (migration edge case)
+        // This handles scans made when user was in pending state
+        if (isEncodedEmail && targetData.email) {
+            const originalEncodedEmail = targetData.uid; // Original encoded email from QR code
+            // Only check if we actually resolved to a different UID
+            if (originalEncodedEmail !== targetUid && originalEncodedEmail.includes('_')) {
+                const oldScanCheckRef = ref(rtdb, `scans/byScanner/${scannerUid}/${originalEncodedEmail}`);
+                const oldScanCheck = await get(oldScanCheckRef);
+                
+                if (oldScanCheck.exists()) {
+                    // User was already scanned when in pending state
+                    // Migrate the old scan record to new UID format
+                    try {
+                        const oldScanData = oldScanCheck.val();
+                        
+                        // Copy scan to new UID location
+                        await set(scanCheckRef, oldScanData);
+                        
+                        // Remove old scan record
+                        await remove(oldScanCheckRef);
+                        
+                        // Also update recent scans cache
+                        const recentScanRef = ref(rtdb, `scans/recent/${scannerUid}/${originalEncodedEmail}`);
+                        const recentScanSnap = await get(recentScanRef);
+                        
+                        if (recentScanSnap.exists()) {
+                            const recentScanData = recentScanSnap.val();
+                            await set(ref(rtdb, `scans/recent/${scannerUid}/${targetUid}`), recentScanData);
+                            await remove(recentScanRef);
+                        }
+                    } catch (migrateError) {
+                        // Error migrating scan record - continue with scan, migration is non-critical
+                    }
+                    
+                    throw new Error('ALREADY_SCANNED');
+                }
+            }
+        }
+        
+        // Step 6: Get scanner user data (for validation only)
+        // Step 6: Get scanner user data (for validation only)
         const scannerUserRef = ref(rtdb, `users/${scannerUid}`);
         const scannerUserSnap = await get(scannerUserRef);
         
@@ -1675,14 +1959,11 @@ async function processScan(qrToken) {
             throw new Error('User not found');
         }
         
-        const userData = scannerUserSnap.val();
-        const currentScore = userData.score || 0;
-        const newScore = currentScore + 10;
-        const newRank = await calculateRankFromRTDB(newScore);
         const scanTimestamp = Date.now();
         const batchId = getCurrentBatchId();
         
-        // Step 6: Record scan in RTDB using transaction for atomicity
+        // Step 6: Record scan in RTDB (atomic batch update)
+        // NOTE: Score/rank updates are handled by batch processor only (prevents race conditions)
         // Ensure all metadata fields are null (not undefined) - RTDB doesn't allow undefined
         const updates = {
             [`scans/byScanner/${scannerUid}/${targetUid}`]: {
@@ -1694,18 +1975,15 @@ async function processScan(qrToken) {
                     district: targetData.district || null
                 }
             },
-            // Note: scans/pending is write-protected (Cloud Functions only)
-            // The batch process doesn't require it - it processes pendingScores directly
+            // Add to pending scores for batch processing (idempotent)
             [`pendingScores/${batchId}/${scannerUid}`]: {
                 delta: 10,
                 timestamp: scanTimestamp
-            },
-            [`users/${scannerUid}/score`]: newScore,
-            [`users/${scannerUid}/rank`]: newRank
+            }
+            // REMOVED: Immediate score/rank update (handled by batch processor only)
         };
         
         // Use RTDB batch update to ensure atomicity
-        // Client SDK uses update(ref(rtdb), updates) not rtdb.ref().update()
         await update(ref(rtdb), updates);
         
         // Step 7: Update recent scans cache (optimistic)
@@ -1720,8 +1998,8 @@ async function processScan(qrToken) {
         };
         await updateRecentScansCache(scannerUid, targetUid, safeTargetData);
         
-        // Step 8: Update localStorage cache
-        updateLocalStorageAfterScan(scannerUid, newScore, newRank, {
+        // Step 7: Update localStorage cache (optimistic - score will be updated by batch)
+        updateLocalStorageAfterScan(scannerUid, null, null, {
             uid: targetUid,
             name: safeTargetData.name,
             photo: safeTargetData.photo
@@ -1730,8 +2008,10 @@ async function processScan(qrToken) {
         // Show subtle success notification
         showToast('check_circle', 'You earned 10 points!', 'success');
         
-        // Reload profile to show updated score (don't await to keep scanner responsive)
-        loadUserProfile();
+        // Reload profile after batch processes (with delay to allow batch to complete)
+        setTimeout(() => {
+            loadUserProfile();
+        }, 6000); // Wait for batch processor (runs every 5 minutes)
         
         // Clear the last scanned token after a delay to allow re-scanning different codes
         setTimeout(() => {
@@ -1932,7 +2212,7 @@ const historyBtnHeader = document.getElementById('history-btn-header');
 if (historyBtnHeader) {
     historyBtnHeader.addEventListener('click', async () => {
         await showView('history');
-        await loadHistory();
+        await loadHistory(0, true); // Reset pagination
     });
 }
 
@@ -1984,7 +2264,7 @@ document.getElementById('back-to-passport-btn').addEventListener('click', async 
 
 document.getElementById('view-history-btn').addEventListener('click', async () => {
     await showView('history');
-    await loadHistory();
+    await loadHistory(0, true); // Reset pagination
 });
 
 document.getElementById('back-from-history-btn').addEventListener('click', async () => {
@@ -2345,28 +2625,40 @@ async function loadCurrentUserFooter(leaderboardParticipants) {
     }
 }
 
-// Load connection history (RTDB-first)
-async function loadHistory() {
+// Pagination state for connection history
+let historyPage = 0;
+const HISTORY_PAGE_SIZE = 20;
+let historyHasMore = true;
+let historyLastKey = null;
+
+// Load connection history with pagination (RTDB-first, optimized)
+async function loadHistory(page = 0, reset = false) {
     if (!currentUser) return;
     
+    // Reset pagination state if starting fresh
+    if (reset) {
+        historyPage = 0;
+        historyHasMore = true;
+        historyLastKey = null;
+    }
+    
     try {
-        // Read from RTDB scans/recent (always prioritize RTDB - single source of truth)
         const recentRef = ref(rtdb, `scans/recent/${currentUser.uid}`);
-        const recentSnap = await get(recentRef);
+        let snapshot;
         
+        // Handle both legacy array format and new object format
+        const recentSnap = await get(recentRef);
+        if (!recentSnap.exists()) {
+            renderHistoryConnections([], true);
+            return;
+        }
+        
+        const recent = recentSnap.val();
         let connections = [];
-        if (recentSnap.exists()) {
-            const recent = recentSnap.val() || [];
-            // If RTDB has empty array, ensure localStorage is also cleared
-            if (Array.isArray(recent) && recent.length === 0) {
-                try {
-                    localStorage.removeItem(`user_${currentUser.uid}_recentConnections`);
-                } catch (localError) {
-                    // localStorage might be disabled, ignore
-                }
-            }
-            
-            // Convert to connection format and sort by timestamp (newest first)
+        
+        // Check if legacy array format
+        if (Array.isArray(recent)) {
+            // Legacy format - convert and handle pagination client-side
             connections = recent
                 .map(conn => ({
                     uid: conn.scannedUid,
@@ -2376,35 +2668,121 @@ async function loadHistory() {
                     email: conn.email || null,
                     phone: conn.phone || null,
                     profession: conn.profession || null,
-                    scannedAt: conn.scannedAt
+                    scannedAt: conn.scannedAt,
+                    _key: `${conn.scannedAt || Date.now()}_${conn.scannedUid}`
                 }))
                 .sort((a, b) => (b.scannedAt || 0) - (a.scannedAt || 0));
             
-            // For connections missing email/phone, try to fetch from users collection
-            const connectionsNeedingData = connections.filter(conn => !conn.email && !conn.phone && conn.uid);
-            if (connectionsNeedingData.length > 0) {
-                await Promise.all(connectionsNeedingData.map(async (conn) => {
-                    try {
-                        const userRef = ref(rtdb, `users/${conn.uid}`);
-                        const userSnap = await get(userRef);
-                        if (userSnap.exists()) {
-                            const userData = userSnap.val();
-                            const profile = userData.profile || {};
-                            conn.email = conn.email || userData.email || profile.email || null;
-                            conn.phone = conn.phone || profile.phone || null;
-                            conn.profession = conn.profession || profile.profession || null;
-                        }
-                    } catch (error) {
-                        // Non-critical, continue
-                    }
+            // Client-side pagination for legacy data
+            const startIdx = page * HISTORY_PAGE_SIZE;
+            const endIdx = startIdx + HISTORY_PAGE_SIZE;
+            connections = connections.slice(startIdx, endIdx);
+            historyHasMore = endIdx < recent.length;
+        } else {
+            // New object format - use RTDB queries for efficient pagination
+            let queryRef;
+            
+            if (historyLastKey) {
+                // Continue from last key (cursor-based pagination)
+                queryRef = query(
+                    recentRef,
+                    orderByKey(),
+                    endAt(historyLastKey),
+                    limitToLast(HISTORY_PAGE_SIZE + 1) // +1 to check if more exists
+                );
+            } else {
+                // First page - get most recent
+                queryRef = query(
+                    recentRef,
+                    orderByKey(),
+                    limitToLast(HISTORY_PAGE_SIZE + 1) // +1 to check if more exists
+                );
+            }
+            
+            snapshot = await get(queryRef);
+            
+            if (snapshot.exists()) {
+                const recentData = snapshot.val() || {};
+                const entries = Object.entries(recentData);
+                
+                // Sort by scannedAt (newest first) since keys are timestamp-based
+                entries.sort((a, b) => (b[1].scannedAt || 0) - (a[1].scannedAt || 0));
+                
+                // Check if we have more pages
+                if (entries.length > HISTORY_PAGE_SIZE) {
+                    historyHasMore = true;
+                    entries.pop(); // Remove the extra one
+                } else {
+                    historyHasMore = false;
+                }
+                
+                connections = entries.map(([key, conn]) => ({
+                    uid: conn.scannedUid,
+                    name: conn.name,
+                    photo: conn.photo,
+                    district: conn.district,
+                    email: conn.email || null,
+                    phone: conn.phone || null,
+                    profession: conn.profession || null,
+                    scannedAt: conn.scannedAt,
+                    _key: key // Store key for pagination
                 }));
+                
+                // Update pagination state
+                if (entries.length > 0) {
+                    historyLastKey = entries[entries.length - 1][0];
+                }
+            } else {
+                historyHasMore = false;
             }
         }
-    
+        
+        // Fetch missing email/phone for connections that need it
+        const connectionsNeedingData = connections.filter(conn => !conn.email && !conn.phone && conn.uid);
+        if (connectionsNeedingData.length > 0) {
+            await Promise.all(connectionsNeedingData.map(async (conn) => {
+                try {
+                    const userRef = ref(rtdb, `users/${conn.uid}`);
+                    const userSnap = await get(userRef);
+                    if (userSnap.exists()) {
+                        const userData = userSnap.val();
+                        const profile = userData.profile || {};
+                        conn.email = conn.email || userData.email || profile.email || null;
+                        conn.phone = conn.phone || profile.phone || null;
+                        conn.profession = conn.profession || profile.profession || null;
+                    }
+                } catch (error) {
+                    // Non-critical, continue
+                }
+            }));
+        }
+        
+        // Render connections
+        renderHistoryConnections(connections, page === 0);
+        
+    } catch (error) {
+        const historyList = document.getElementById('history-list');
+        if (historyList) {
+            historyList.innerHTML = `
+                <div class="text-center py-12">
+                    <span class="material-symbols-outlined text-6xl text-white/40 mb-4">error</span>
+                    <p class="text-white/70">Error loading connection history. Please try again.</p>
+                </div>
+            `;
+        }
+    }
+}
+
+function renderHistoryConnections(connections, isFirstPage) {
     const historyList = document.getElementById('history-list');
-    historyList.innerHTML = '';
+    if (!historyList) return;
     
-    if (connections.length === 0) {
+    // Clear only if first page
+    if (isFirstPage) {
+        historyList.innerHTML = '';
+    }
+    
+    if (connections.length === 0 && isFirstPage) {
         historyList.innerHTML = `
             <div class="text-center py-12">
                 <span class="material-symbols-outlined text-6xl text-white/40 mb-4">qr_code_scanner</span>
@@ -2415,6 +2793,7 @@ async function loadHistory() {
         return;
     }
     
+    // Append connections to existing list
     connections.forEach(conn => {
         const scannedAt = conn.scannedAt;
         const date = scannedAt ? (
@@ -2465,16 +2844,23 @@ async function loadHistory() {
         
         historyList.appendChild(item);
     });
-    } catch (error) {
-        const historyList = document.getElementById('history-list');
-        if (historyList) {
-            historyList.innerHTML = `
-                <div class="text-center py-12">
-                    <span class="material-symbols-outlined text-6xl text-white/40 mb-4">error</span>
-                    <p class="text-white/70">Error loading connection history. Please try again.</p>
-                </div>
-            `;
-        }
+    
+    // Remove existing "Load More" button if present
+    const existingLoadMore = historyList.querySelector('.load-more-history-btn');
+    if (existingLoadMore) {
+        existingLoadMore.remove();
+    }
+    
+    // Add "Load More" button if more pages available
+    if (historyHasMore) {
+        const loadMoreBtn = document.createElement('button');
+        loadMoreBtn.className = 'load-more-history-btn w-full mt-4 py-3 bg-primary/20 hover:bg-primary/30 text-primary font-semibold rounded-xl transition-colors';
+        loadMoreBtn.textContent = 'Load More';
+        loadMoreBtn.onclick = () => {
+            historyPage++;
+            loadHistory(historyPage, false);
+        };
+        historyList.appendChild(loadMoreBtn);
     }
 }
 

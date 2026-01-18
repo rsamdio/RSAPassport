@@ -7,6 +7,12 @@
         ".write": "auth != null && auth.uid == $uid"
       }
     },
+    "users_scores": {
+      "$uid": {
+        ".read": "auth != null",
+        ".write": false
+      }
+    },
     "qrcodes": {
       "$qrToken": {
         ".read": "auth != null",
@@ -64,7 +70,8 @@
       },
       "sortedScores": {
         ".read": "auth != null",
-        ".write": false
+        ".write": false,
+        ".indexOn": ["score", "firstLoginAt"]
       }
     },
     "pendingUsers": {

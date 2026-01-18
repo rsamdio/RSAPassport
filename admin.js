@@ -1453,7 +1453,7 @@ async function loadParticipants(forceRefresh = false) {
     const participantsList = document.getElementById('participants-list');
     if (!participantsList) return;
     
-    participantsList.innerHTML = '<tr><td colspan="6" class="text-center py-8 text-slate-400">Loading...</td></tr>';
+        participantsList.innerHTML = '<tr><td colspan="6" class="text-center py-8 text-slate-400">Loading...</td></tr>';
     
     try {
         let participants = [];
@@ -1513,7 +1513,7 @@ async function loadParticipants(forceRefresh = false) {
                         useCache = true;
                     }
                 }
-            } catch (error) {
+        } catch (error) {
                 // Fallback to RTDB direct read
             }
         }
@@ -1527,32 +1527,32 @@ async function loadParticipants(forceRefresh = false) {
                 get(pendingUsersRef),
                 get(usersRef)
             ]);
-            
+        
             // Add pending users (child.key is encoded email)
             if (pendingSnap.exists()) {
                 pendingSnap.forEach((child) => {
                     const data = child.val();
-                    participants.push({
+            participants.push({
                         id: child.key, // encoded email
-                        type: 'pending',
+                type: 'pending',
                         identifier: child.key, // encoded email (for delete/view operations)
                         email: data.email || decodeEmailFromPath(child.key), // actual email
                         sortDate: data.createdAt || 0,
                         rank: data.rank || 'Rookie', // Default to 'Rookie' for pending users
                         score: data.score || 0,
-                        ...data
-                    });
-                });
+                ...data
+            });
+        });
             }
-            
-            // Add active users
+        
+        // Add active users
             if (usersSnap.exists()) {
                 usersSnap.forEach((child) => {
                     const data = child.val();
                     const profile = data.profile || {};
-                    participants.push({
+            participants.push({
                         id: child.key,
-                        type: 'active',
+                type: 'active',
                         identifier: child.key, // uid
                         uid: child.key,
                         sortDate: data.firstLoginAt || data.lastLoginAt || 0,
@@ -1571,8 +1571,8 @@ async function loadParticipants(forceRefresh = false) {
                         qrToken: data.qrToken,
                         firstLoginAt: data.firstLoginAt,
                         lastLoginAt: data.lastLoginAt
-                    });
-                });
+            });
+        });
             }
         }
         
@@ -1709,47 +1709,47 @@ async function exportAllParticipants() {
                 get(pendingUsersRef),
                 get(usersRef)
             ]);
-            
-            // Add pending users
+        
+        // Add pending users
             if (pendingSnap.exists()) {
                 pendingSnap.forEach((child) => {
                     const data = child.val();
-                    participants.push({
-                        participantId: data.participantId || 'N/A',
-                        fullName: data.fullName || 'N/A',
-                        district: data.district || 'N/A',
-                        email: data.email || 'N/A',
-                        phone: data.phone || 'N/A',
-                        profession: data.profession || 'N/A',
-                        status: 'Pending Login',
-                        rank: 'N/A',
-                        score: 0,
+            participants.push({
+                participantId: data.participantId || 'N/A',
+                fullName: data.fullName || 'N/A',
+                district: data.district || 'N/A',
+                email: data.email || 'N/A',
+                phone: data.phone || 'N/A',
+                profession: data.profession || 'N/A',
+                status: 'Pending Login',
+                rank: 'N/A',
+                score: 0,
                         date: data.createdAt ? new Date(data.createdAt).toLocaleDateString() : 'N/A',
-                        type: 'pending'
-                    });
-                });
+                type: 'pending'
+            });
+        });
             }
-            
-            // Add active users
+        
+        // Add active users
             if (usersSnap.exists()) {
                 usersSnap.forEach((child) => {
                     const data = child.val();
                     const profile = data.profile || {};
-                    participants.push({
-                        participantId: data.participantId || 'N/A',
+            participants.push({
+                participantId: data.participantId || 'N/A',
                         fullName: profile.fullName || profile.displayName || 'N/A',
                         district: profile.district || 'N/A',
-                        email: data.email || 'N/A',
+                email: data.email || 'N/A',
                         phone: profile.phone || 'N/A',
                         profession: profile.profession || 'N/A',
-                        status: 'Active',
-                        rank: data.rank || 'N/A',
-                        score: data.score || 0,
+                status: 'Active',
+                rank: data.rank || 'N/A',
+                score: data.score || 0,
                         date: data.lastLoginAt ? new Date(data.lastLoginAt).toLocaleDateString() : 
                               data.firstLoginAt ? new Date(data.firstLoginAt).toLocaleDateString() : 'N/A',
-                        type: 'active'
-                    });
-                });
+                type: 'active'
+            });
+        });
             }
         }
         
