@@ -545,7 +545,7 @@ async function migratePendingUser(uid, normalizedEmail, pendingData) {
             const qrCodeRef = ref(rtdb, `qrcodes/${qrToken}`);
             
             await update(qrCodeRef, {
-                uid: uid,
+            uid: uid,
                 name: profile.fullName || profile.displayName || pendingData.fullName || "User",
                 photo: authPhotoURL || null,
                 email: normalizedEmail,
@@ -812,6 +812,9 @@ async function calculateRankFromRTDB(score) {
 // Helper: Update recent scans cache in RTDB
 async function updateRecentScansCache(scannerUid, scannedUid, qrData) {
     try {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:813',message:'updateRecentScansCache: Entry',data:{scannerUid,scannedUid},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+        // #endregion
         const recentRef = ref(rtdb, `scans/recent/${scannerUid}`);
         const scanTimestamp = Date.now();
         const scanKey = `${scanTimestamp}_${scannedUid}`; // Unique key for pagination
@@ -829,6 +832,9 @@ async function updateRecentScansCache(scannerUid, scannedUid, qrData) {
                 scannedAt: scanTimestamp
             }
         });
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:831',message:'updateRecentScansCache: Write success',data:{scannerUid,scanKey},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+        // #endregion
         
         // Optional: Cleanup old entries (keep last 500)
         // This prevents unbounded growth
@@ -856,6 +862,9 @@ async function updateRecentScansCache(scannerUid, scannedUid, qrData) {
             }
         }
     } catch (error) {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:859',message:'updateRecentScansCache: Error',data:{error:error.message,scannerUid},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+        // #endregion
         // Error updating recent scans cache - non-critical, ignore
     }
 }
@@ -1072,9 +1081,17 @@ async function loadUserProfile() {
         // Validate session before loading profile (fixes zombie token)
         await validateLocalSession();
         
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:1084',message:'loadUserProfile: Before RTDB read',data:{uid:currentUser.uid},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'F'})}).catch(()=>{});
+        // #endregion
+        
         // Get user data from RTDB (primary source) - always fetch for freshness
         const userRef = ref(rtdb, `users/${currentUser.uid}`);
         const userSnap = await get(userRef);
+        
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:1086',message:'loadUserProfile: RTDB read result',data:{uid:currentUser.uid,exists:userSnap.exists()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'F'})}).catch(()=>{});
+        // #endregion
         
         if (userSnap.exists()) {
             const userData = userSnap.val();
@@ -1945,7 +1962,7 @@ async function processScan(qrToken) {
                         // Error migrating scan record - continue with scan, migration is non-critical
                     }
                     
-                    throw new Error('ALREADY_SCANNED');
+                throw new Error('ALREADY_SCANNED');
                 }
             }
         }
@@ -1962,9 +1979,24 @@ async function processScan(qrToken) {
         const scanTimestamp = Date.now();
         const batchId = getCurrentBatchId();
         
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:1979',message:'processScan: Before RTDB write',data:{scannerUid,targetUid,batchId,scanTimestamp},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+        // #endregion
+        
         // Step 6: Record scan in RTDB (atomic batch update)
         // NOTE: Score/rank updates are handled by batch processor only (prevents race conditions)
         // Ensure all metadata fields are null (not undefined) - RTDB doesn't allow undefined
+        
+        // CRITICAL FIX: Read current pending score and accumulate delta to handle multiple scans in same batch
+        const pendingScoreRef = ref(rtdb, `pendingScores/${batchId}/${scannerUid}`);
+        const pendingScoreSnap = await get(pendingScoreRef);
+        const currentDelta = pendingScoreSnap.exists() ? (pendingScoreSnap.val().delta || 0) : 0;
+        const newDelta = currentDelta + 10; // Accumulate instead of overwrite
+        
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:1990',message:'processScan: Pending score accumulation',data:{batchId,scannerUid,currentDelta,newDelta},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'J'})}).catch(()=>{});
+        // #endregion
+        
         const updates = {
             [`scans/byScanner/${scannerUid}/${targetUid}`]: {
                 scannedAt: scanTimestamp,
@@ -1975,16 +2007,26 @@ async function processScan(qrToken) {
                     district: targetData.district || null
                 }
             },
-            // Add to pending scores for batch processing (idempotent)
+            // Add to pending scores for batch processing (accumulate delta for multiple scans)
             [`pendingScores/${batchId}/${scannerUid}`]: {
-                delta: 10,
+                delta: newDelta,
                 timestamp: scanTimestamp
             }
             // REMOVED: Immediate score/rank update (handled by batch processor only)
         };
         
         // Use RTDB batch update to ensure atomicity
-        await update(ref(rtdb), updates);
+        try {
+            await update(ref(rtdb), updates);
+            // #region agent log
+            fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2015',message:'processScan: RTDB write success',data:{batchId,scannerUid,delta:newDelta},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+            // #endregion
+        } catch (updateError) {
+            // #region agent log
+            fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2018',message:'processScan: RTDB write failed',data:{error:updateError.message,batchId,scannerUid},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+            // #endregion
+            throw updateError;
+        }
         
         // Step 7: Update recent scans cache (optimistic)
         // Ensure targetData has all required fields with null fallbacks
@@ -1996,7 +2038,13 @@ async function processScan(qrToken) {
             phone: targetData.phone || null,
             profession: targetData.profession || null
         };
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:1999',message:'processScan: Before updateRecentScansCache',data:{scannerUid,targetUid},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+        // #endregion
         await updateRecentScansCache(scannerUid, targetUid, safeTargetData);
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2001',message:'processScan: After updateRecentScansCache',data:{scannerUid,targetUid},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+        // #endregion
         
         // Step 7: Update localStorage cache (optimistic - score will be updated by batch)
         updateLocalStorageAfterScan(scannerUid, null, null, {
@@ -2010,7 +2058,7 @@ async function processScan(qrToken) {
         
         // Reload profile after batch processes (with delay to allow batch to complete)
         setTimeout(() => {
-            loadUserProfile();
+        loadUserProfile();
         }, 6000); // Wait for batch processor (runs every 5 minutes)
         
         // Clear the last scanned token after a delay to allow re-scanning different codes
@@ -2635,6 +2683,10 @@ let historyLastKey = null;
 async function loadHistory(page = 0, reset = false) {
     if (!currentUser) return;
     
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2635',message:'loadHistory: Entry',data:{uid:currentUser.uid,page,reset},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+    // #endregion
+    
     // Reset pagination state if starting fresh
     if (reset) {
         historyPage = 0;
@@ -2648,6 +2700,9 @@ async function loadHistory(page = 0, reset = false) {
         
         // Handle both legacy array format and new object format
         const recentSnap = await get(recentRef);
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2650',message:'loadHistory: RTDB read result',data:{exists:recentSnap.exists(),uid:currentUser.uid},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+        // #endregion
         if (!recentSnap.exists()) {
             renderHistoryConnections([], true);
             return;
@@ -2655,6 +2710,9 @@ async function loadHistory(page = 0, reset = false) {
         
         const recent = recentSnap.val();
         let connections = [];
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2657',message:'loadHistory: Data format check',data:{isArray:Array.isArray(recent),isObject:typeof recent==='object',keysCount:recent?Object.keys(recent).length:0},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
+        // #endregion
         
         // Check if legacy array format
         if (Array.isArray(recent)) {
@@ -2757,10 +2815,16 @@ async function loadHistory(page = 0, reset = false) {
             }));
         }
         
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2772',message:'loadHistory: Before render',data:{connectionsCount:connections.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+        // #endregion
         // Render connections
         renderHistoryConnections(connections, page === 0);
         
     } catch (error) {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/24601f12-f86c-40e9-8147-45a088a59d9c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'app.js:2775',message:'loadHistory: Error',data:{error:error.message,uid:currentUser?.uid},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+        // #endregion
         const historyList = document.getElementById('history-list');
         if (historyList) {
             historyList.innerHTML = `
@@ -2779,7 +2843,7 @@ function renderHistoryConnections(connections, isFirstPage) {
     
     // Clear only if first page
     if (isFirstPage) {
-        historyList.innerHTML = '';
+    historyList.innerHTML = '';
     }
     
     if (connections.length === 0 && isFirstPage) {

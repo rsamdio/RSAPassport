@@ -68,9 +68,38 @@ exports.batchProcessScores = onSchedule(
       const currentBatchId = getCurrentBatchId();
       const processedBatches = new Set();
 
+      // #region agent log
+      const logData = {
+        location: "functions/index.js:67",
+        message: "batchProcessScores: Entry",
+        data: {currentBatchId},
+        timestamp: Date.now(),
+        sessionId: "debug-session",
+        runId: "run1",
+        hypothesisId: "B",
+      };
+      console.log(JSON.stringify(logData));
+      // #endregion
+
       try {
         // 1. Process current batch first (most common case)
         const currentResult = await processBatchIdempotent(currentBatchId);
+        // #region agent log
+        const logData2 = {
+          location: "functions/index.js:73",
+          message: "batchProcessScores: Current batch result",
+          data: {
+            currentBatchId,
+            processed: currentResult.processed,
+            processedUsers: currentResult.processedUsers,
+          },
+          timestamp: Date.now(),
+          sessionId: "debug-session",
+          runId: "run1",
+          hypothesisId: "B",
+        };
+        console.log(JSON.stringify(logData2));
+        // #endregion
         if (currentResult.processed) {
           processedBatches.add(currentBatchId);
         }
@@ -109,9 +138,34 @@ async function processBatchIdempotent(batchId) {
   const pendingScoresRef = rtdb.ref(`pendingScores/${batchId}`);
   const lockRef = rtdb.ref(`pendingScores/${batchId}/_processing`);
 
+  // #region agent log
+  const logData = {
+    location: "functions/index.js:108",
+    message: "processBatchIdempotent: Entry",
+    data: {batchId},
+    timestamp: Date.now(),
+    sessionId: "debug-session",
+    runId: "run1",
+    hypothesisId: "B",
+  };
+  console.log(JSON.stringify(logData));
+  // #endregion
+
   try {
     // 1. Check if batch exists
     const pendingScoresSnap = await pendingScoresRef.once("value");
+    // #region agent log
+    const logData2 = {
+      location: "functions/index.js:114",
+      message: "processBatchIdempotent: Batch exists check",
+      data: {batchId, exists: pendingScoresSnap.exists()},
+      timestamp: Date.now(),
+      sessionId: "debug-session",
+      runId: "run1",
+      hypothesisId: "B",
+    };
+    console.log(JSON.stringify(logData2));
+    // #endregion
     if (!pendingScoresSnap.exists()) {
       return {processed: false, message: "Batch does not exist"};
     }
@@ -169,6 +223,22 @@ async function processBatchIdempotent(batchId) {
     const pendingScores = pendingScoresSnap.val();
     const scoreUpdates = {};
     const affectedUids = new Set();
+
+    // #region agent log
+    const pendingCount = Object.keys(pendingScores)
+        .filter((k) => k !== "_processing")
+        .length;
+    const logData3 = {
+      location: "functions/index.js:169",
+      message: "processBatchIdempotent: Pending scores read",
+      data: {batchId, pendingCount},
+      timestamp: Date.now(),
+      sessionId: "debug-session",
+      runId: "run1",
+      hypothesisId: "B",
+    };
+    console.log(JSON.stringify(logData3));
+    // #endregion
 
     // 5. Aggregate score changes (idempotent: read current score, add delta)
     for (const [uid, scoreData] of Object.entries(pendingScores)) {
@@ -243,7 +313,35 @@ async function processBatchIdempotent(batchId) {
 
     // 6. Batch update all scores (atomic)
     if (Object.keys(scoreUpdates).length > 0) {
+      // #region agent log
+      const logData4 = {
+        location: "functions/index.js:245",
+        message: "processBatchIdempotent: Before score update",
+        data: {
+          batchId,
+          updateCount: Object.keys(scoreUpdates).length,
+          affectedUids: Array.from(affectedUids),
+        },
+        timestamp: Date.now(),
+        sessionId: "debug-session",
+        runId: "run1",
+        hypothesisId: "B",
+      };
+      console.log(JSON.stringify(logData4));
+      // #endregion
       await rtdb.ref().update(scoreUpdates);
+      // #region agent log
+      const logData5 = {
+        location: "functions/index.js:247",
+        message: "processBatchIdempotent: Score update success",
+        data: {batchId, affectedUids: Array.from(affectedUids)},
+        timestamp: Date.now(),
+        sessionId: "debug-session",
+        runId: "run1",
+        hypothesisId: "B",
+      };
+      console.log(JSON.stringify(logData5));
+      // #endregion
     }
 
     // 7. Update indexes and caches
@@ -251,6 +349,18 @@ async function processBatchIdempotent(batchId) {
       await updateSortedScoreIndex(Array.from(affectedUids));
       await updateRanksIncremental(Array.from(affectedUids));
       await updateLeaderboardIncremental(Array.from(affectedUids));
+      // #region agent log
+      const logData6 = {
+        location: "functions/index.js:253",
+        message: "processBatchIdempotent: Indexes updated",
+        data: {batchId, affectedUids: Array.from(affectedUids)},
+        timestamp: Date.now(),
+        sessionId: "debug-session",
+        runId: "run1",
+        hypothesisId: "B",
+      };
+      console.log(JSON.stringify(logData6));
+      // #endregion
     }
 
     // 8. Delete batch and lock (atomic - both or neither)
@@ -326,6 +436,23 @@ async function findExpiredBatches(lookbackBatches = 24) {
  * @param {boolean} rebuildAll If true, rebuilds index from all users
  */
 async function updateSortedScoreIndex(affectedUids, rebuildAll = false) {
+  // #region agent log
+  const logDataIdx = {
+    location: "functions/index.js:438",
+    message: "updateSortedScoreIndex: Entry",
+    data: {
+      affectedUids,
+      rebuildAll,
+      affectedCount: affectedUids.length,
+    },
+    timestamp: Date.now(),
+    sessionId: "debug-session",
+    runId: "run1",
+    hypothesisId: "I",
+  };
+  console.log(JSON.stringify(logDataIdx));
+  // #endregion
+
   const indexRef = rtdb.ref("indexes/sortedScores");
 
   // If rebuilding all, get all users and rebuild index from scratch
@@ -407,6 +534,25 @@ async function updateSortedScoreIndex(affectedUids, rebuildAll = false) {
   // Update index (limit to top 1000 for efficiency)
   const limitedIndex = sortedIndex.slice(0, 1000);
   await indexRef.set(limitedIndex);
+
+  // #region agent log
+  const logDataIdx2 = {
+    location: "functions/index.js:519",
+    message: "updateSortedScoreIndex: Index updated",
+    data: {
+      affectedUids,
+      indexSize: limitedIndex.length,
+      affectedInIndex: limitedIndex
+          .filter((e) => affectedUids.includes(e.uid))
+          .length,
+    },
+    timestamp: Date.now(),
+    sessionId: "debug-session",
+    runId: "run1",
+    hypothesisId: "I",
+  };
+  console.log(JSON.stringify(logDataIdx2));
+  // #endregion
 }
 
 /**
@@ -474,6 +620,19 @@ async function updateRanksIncremental(affectedUids) {
  * @param {Array<string>} affectedUids Array of user UIDs that changed
  */
 async function updateLeaderboardIncremental(affectedUids) {
+  // #region agent log
+  const logDataLb = {
+    location: "functions/index.js:586",
+    message: "updateLeaderboardIncremental: Entry",
+    data: {affectedUids, affectedCount: affectedUids.length},
+    timestamp: Date.now(),
+    sessionId: "debug-session",
+    runId: "run1",
+    hypothesisId: "I",
+  };
+  console.log(JSON.stringify(logDataLb));
+  // #endregion
+
   // Get sorted score index (much faster than reading all users)
   const indexRef = rtdb.ref("indexes/sortedScores");
 
@@ -490,8 +649,50 @@ async function updateLeaderboardIncremental(affectedUids) {
   }
 
   const sortedIndex = indexSnap.val() || [];
+  // #region agent log
+  const logDataLb2 = {
+    location: "functions/index.js:602",
+    message: "updateLeaderboardIncremental: Index read",
+    data: {
+      indexSize: sortedIndex.length,
+      affectedInIndex: sortedIndex
+          .filter((e) => affectedUids.includes(e.uid))
+          .length,
+      allUids: sortedIndex.map((e) => e.uid),
+    },
+    timestamp: Date.now(),
+    sessionId: "debug-session",
+    runId: "run1",
+    hypothesisId: "I",
+  };
+  console.log(JSON.stringify(logDataLb2));
+  // #endregion
+
   // Get top 10 (most efficient - only processes first 10 entries)
-  const top10Index = sortedIndex.slice(0, 10);
+  // CRITICAL FIX: If there are fewer than 10 users total,
+  // show all users (including 0-score users)
+  const top10Index = sortedIndex.length < 10 ?
+    sortedIndex :
+    sortedIndex.slice(0, 10);
+
+  // #region agent log
+  const logDataLb3 = {
+    location: "functions/index.js:610",
+    message: "updateLeaderboardIncremental: Top 10 extracted",
+    data: {
+      top10Count: top10Index.length,
+      top10Uids: top10Index.map((e) => e.uid),
+      affectedInTop10: top10Index
+          .filter((e) => affectedUids.includes(e.uid))
+          .length,
+    },
+    timestamp: Date.now(),
+    sessionId: "debug-session",
+    runId: "run1",
+    hypothesisId: "I",
+  };
+  console.log(JSON.stringify(logDataLb3));
+  // #endregion
 
   // Get user details for top 10 only (much fewer reads)
   const allUsers = [];
@@ -564,6 +765,23 @@ async function updateLeaderboardIncremental(affectedUids) {
     lastUpdated: Date.now(),
     totalUsers: allUsers.length,
   });
+
+  // #region agent log
+  const logDataLb4 = {
+    location: "functions/index.js:705",
+    message: "updateLeaderboardIncremental: Leaderboard updated",
+    data: {
+      top10Uids: allUsers.map((u) => u.uid),
+      top10Scores: allUsers.map((u) => u.score),
+      affectedUids,
+    },
+    timestamp: Date.now(),
+    sessionId: "debug-session",
+    runId: "run1",
+    hypothesisId: "I",
+  };
+  console.log(JSON.stringify(logDataLb4));
+  // #endregion
 }
 
 /**
@@ -1194,14 +1412,53 @@ exports.onUserCreated = onValueCreated(
         // Add user to active cache
         await updateAdminCacheIncremental(uid, "active", updatedUserData);
 
+        // #region agent log
+        const logData7 = {
+          location: "functions/index.js:1206",
+          message: "onUserCreated: Before index updates",
+          data: {uid, score: userData.score || 0},
+          timestamp: Date.now(),
+          sessionId: "debug-session",
+          runId: "run1",
+          hypothesisId: "I",
+        };
+        console.log(JSON.stringify(logData7));
+        // #endregion
+
         // Update sorted score index
         await updateSortedScoreIndex([uid]);
+
+        // #region agent log
+        const logData8 = {
+          location: "functions/index.js:1210",
+          message: "onUserCreated: After updateSortedScoreIndex",
+          data: {uid},
+          timestamp: Date.now(),
+          sessionId: "debug-session",
+          runId: "run1",
+          hypothesisId: "I",
+        };
+        console.log(JSON.stringify(logData8));
+        // #endregion
 
         // Update ranks for this user
         await updateRanksIncremental([uid]);
 
         // Update leaderboard if user is in top 10
         await updateLeaderboardIncremental([uid]);
+
+        // #region agent log
+        const logData9 = {
+          location: "functions/index.js:1214",
+          message: "onUserCreated: After updateLeaderboardIncremental",
+          data: {uid},
+          timestamp: Date.now(),
+          sessionId: "debug-session",
+          runId: "run1",
+          hypothesisId: "I",
+        };
+        console.log(JSON.stringify(logData9));
+        // #endregion
       } catch (error) {
         // Non-critical, don't throw
       }
