@@ -30,14 +30,16 @@ const db = admin.firestore();
  */
 function getCurrentBatchId() {
   const now = new Date();
-  const minutes = Math.floor(now.getMinutes() / 5) * 5;
-  const batchDate = new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      now.getDate(),
-      now.getHours(),
+  const minutes = Math.floor(now.getUTCMinutes() / 5) * 5;
+  // CRITICAL: Use UTC methods to match client-side calculation
+  // This ensures batch IDs are consistent across all timezones
+  const batchDate = new Date(Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate(),
+      now.getUTCHours(),
       minutes,
-  );
+  ));
   return batchDate.toISOString().slice(0, 16).replace("T", "-");
 }
 
@@ -67,39 +69,10 @@ exports.batchProcessScores = onSchedule(
     async (event) => {
       const currentBatchId = getCurrentBatchId();
       const processedBatches = new Set();
-
-      // #region agent log
-      const logData = {
-        location: "functions/index.js:67",
-        message: "batchProcessScores: Entry",
-        data: {currentBatchId},
-        timestamp: Date.now(),
-        sessionId: "debug-session",
-        runId: "run1",
-        hypothesisId: "B",
-      };
-      console.log(JSON.stringify(logData));
-      // #endregion
-
       try {
         // 1. Process current batch first (most common case)
-        const currentResult = await processBatchIdempotent(currentBatchId);
-        // #region agent log
-        const logData2 = {
-          location: "functions/index.js:73",
-          message: "batchProcessScores: Current batch result",
-          data: {
-            currentBatchId,
-            processed: currentResult.processed,
-            processedUsers: currentResult.processedUsers,
-          },
-          timestamp: Date.now(),
-          sessionId: "debug-session",
-          runId: "run1",
-          hypothesisId: "B",
-        };
-        console.log(JSON.stringify(logData2));
-        // #endregion
+        const currentResult =
+            await processBatchIdempotent(currentBatchId);
         if (currentResult.processed) {
           processedBatches.add(currentBatchId);
         }
@@ -137,35 +110,9 @@ exports.batchProcessScores = onSchedule(
 async function processBatchIdempotent(batchId) {
   const pendingScoresRef = rtdb.ref(`pendingScores/${batchId}`);
   const lockRef = rtdb.ref(`pendingScores/${batchId}/_processing`);
-
-  // #region agent log
-  const logData = {
-    location: "functions/index.js:108",
-    message: "processBatchIdempotent: Entry",
-    data: {batchId},
-    timestamp: Date.now(),
-    sessionId: "debug-session",
-    runId: "run1",
-    hypothesisId: "B",
-  };
-  console.log(JSON.stringify(logData));
-  // #endregion
-
   try {
     // 1. Check if batch exists
     const pendingScoresSnap = await pendingScoresRef.once("value");
-    // #region agent log
-    const logData2 = {
-      location: "functions/index.js:114",
-      message: "processBatchIdempotent: Batch exists check",
-      data: {batchId, exists: pendingScoresSnap.exists()},
-      timestamp: Date.now(),
-      sessionId: "debug-session",
-      runId: "run1",
-      hypothesisId: "B",
-    };
-    console.log(JSON.stringify(logData2));
-    // #endregion
     if (!pendingScoresSnap.exists()) {
       return {processed: false, message: "Batch does not exist"};
     }
@@ -223,23 +170,6 @@ async function processBatchIdempotent(batchId) {
     const pendingScores = pendingScoresSnap.val();
     const scoreUpdates = {};
     const affectedUids = new Set();
-
-    // #region agent log
-    const pendingCount = Object.keys(pendingScores)
-        .filter((k) => k !== "_processing")
-        .length;
-    const logData3 = {
-      location: "functions/index.js:169",
-      message: "processBatchIdempotent: Pending scores read",
-      data: {batchId, pendingCount},
-      timestamp: Date.now(),
-      sessionId: "debug-session",
-      runId: "run1",
-      hypothesisId: "B",
-    };
-    console.log(JSON.stringify(logData3));
-    // #endregion
-
     // 5. Aggregate score changes (idempotent: read current score, add delta)
     for (const [uid, scoreData] of Object.entries(pendingScores)) {
       // Skip lock entry
@@ -313,35 +243,7 @@ async function processBatchIdempotent(batchId) {
 
     // 6. Batch update all scores (atomic)
     if (Object.keys(scoreUpdates).length > 0) {
-      // #region agent log
-      const logData4 = {
-        location: "functions/index.js:245",
-        message: "processBatchIdempotent: Before score update",
-        data: {
-          batchId,
-          updateCount: Object.keys(scoreUpdates).length,
-          affectedUids: Array.from(affectedUids),
-        },
-        timestamp: Date.now(),
-        sessionId: "debug-session",
-        runId: "run1",
-        hypothesisId: "B",
-      };
-      console.log(JSON.stringify(logData4));
-      // #endregion
       await rtdb.ref().update(scoreUpdates);
-      // #region agent log
-      const logData5 = {
-        location: "functions/index.js:247",
-        message: "processBatchIdempotent: Score update success",
-        data: {batchId, affectedUids: Array.from(affectedUids)},
-        timestamp: Date.now(),
-        sessionId: "debug-session",
-        runId: "run1",
-        hypothesisId: "B",
-      };
-      console.log(JSON.stringify(logData5));
-      // #endregion
     }
 
     // 7. Update indexes and caches
@@ -349,18 +251,6 @@ async function processBatchIdempotent(batchId) {
       await updateSortedScoreIndex(Array.from(affectedUids));
       await updateRanksIncremental(Array.from(affectedUids));
       await updateLeaderboardIncremental(Array.from(affectedUids));
-      // #region agent log
-      const logData6 = {
-        location: "functions/index.js:253",
-        message: "processBatchIdempotent: Indexes updated",
-        data: {batchId, affectedUids: Array.from(affectedUids)},
-        timestamp: Date.now(),
-        sessionId: "debug-session",
-        runId: "run1",
-        hypothesisId: "B",
-      };
-      console.log(JSON.stringify(logData6));
-      // #endregion
     }
 
     // 8. Delete batch and lock (atomic - both or neither)
@@ -395,16 +285,17 @@ async function findExpiredBatches(lookbackBatches = 24) {
   const now = new Date();
 
   // Generate batch IDs for last N batches (5-minute intervals)
+  // CRITICAL: Use UTC methods to match client-side calculation
   for (let i = 1; i <= lookbackBatches; i++) {
     const batchDate = new Date(now.getTime() - (i * 5 * 60 * 1000));
-    const minutes = Math.floor(batchDate.getMinutes() / 5) * 5;
-    const batchDateRounded = new Date(
-        batchDate.getFullYear(),
-        batchDate.getMonth(),
-        batchDate.getDate(),
-        batchDate.getHours(),
+    const minutes = Math.floor(batchDate.getUTCMinutes() / 5) * 5;
+    const batchDateRounded = new Date(Date.UTC(
+        batchDate.getUTCFullYear(),
+        batchDate.getUTCMonth(),
+        batchDate.getUTCDate(),
+        batchDate.getUTCHours(),
         minutes,
-    );
+    ));
     const batchId = batchDateRounded.toISOString()
         .slice(0, 16)
         .replace("T", "-");
@@ -436,23 +327,6 @@ async function findExpiredBatches(lookbackBatches = 24) {
  * @param {boolean} rebuildAll If true, rebuilds index from all users
  */
 async function updateSortedScoreIndex(affectedUids, rebuildAll = false) {
-  // #region agent log
-  const logDataIdx = {
-    location: "functions/index.js:438",
-    message: "updateSortedScoreIndex: Entry",
-    data: {
-      affectedUids,
-      rebuildAll,
-      affectedCount: affectedUids.length,
-    },
-    timestamp: Date.now(),
-    sessionId: "debug-session",
-    runId: "run1",
-    hypothesisId: "I",
-  };
-  console.log(JSON.stringify(logDataIdx));
-  // #endregion
-
   const indexRef = rtdb.ref("indexes/sortedScores");
 
   // If rebuilding all, get all users and rebuild index from scratch
@@ -486,6 +360,14 @@ async function updateSortedScoreIndex(affectedUids, rebuildAll = false) {
   const indexSnap = await indexRef.once("value");
   let sortedIndex = indexSnap.exists() ? indexSnap.val() : [];
 
+  // CRITICAL FIX: If index is empty or missing, rebuild from all users
+  if (sortedIndex.length === 0) {
+    await updateSortedScoreIndex([], true);
+    // Re-read the index after rebuild
+    const rebuiltSnap = await indexRef.once("value");
+    sortedIndex = rebuiltSnap.exists() ? rebuiltSnap.val() : [];
+  }
+
   // Get affected users' current scores
   const userScores = {};
   for (const uid of affectedUids) {
@@ -500,12 +382,11 @@ async function updateSortedScoreIndex(affectedUids, rebuildAll = false) {
     }
   }
 
-  // Remove affected users from index
+  // Remove affected users from index (prevent duplicates)
+  // CRITICAL FIX: Filter out duplicates before re-inserting
   sortedIndex = sortedIndex.filter(
       (entry) => !affectedUids.includes(entry.uid),
-  );
-
-  // Re-insert affected users in correct position
+  ); // Re-insert affected users in correct position
   for (const uid of affectedUids) {
     if (!userScores[uid]) continue;
 
@@ -534,25 +415,6 @@ async function updateSortedScoreIndex(affectedUids, rebuildAll = false) {
   // Update index (limit to top 1000 for efficiency)
   const limitedIndex = sortedIndex.slice(0, 1000);
   await indexRef.set(limitedIndex);
-
-  // #region agent log
-  const logDataIdx2 = {
-    location: "functions/index.js:519",
-    message: "updateSortedScoreIndex: Index updated",
-    data: {
-      affectedUids,
-      indexSize: limitedIndex.length,
-      affectedInIndex: limitedIndex
-          .filter((e) => affectedUids.includes(e.uid))
-          .length,
-    },
-    timestamp: Date.now(),
-    sessionId: "debug-session",
-    runId: "run1",
-    hypothesisId: "I",
-  };
-  console.log(JSON.stringify(logDataIdx2));
-  // #endregion
 }
 
 /**
@@ -620,19 +482,6 @@ async function updateRanksIncremental(affectedUids) {
  * @param {Array<string>} affectedUids Array of user UIDs that changed
  */
 async function updateLeaderboardIncremental(affectedUids) {
-  // #region agent log
-  const logDataLb = {
-    location: "functions/index.js:586",
-    message: "updateLeaderboardIncremental: Entry",
-    data: {affectedUids, affectedCount: affectedUids.length},
-    timestamp: Date.now(),
-    sessionId: "debug-session",
-    runId: "run1",
-    hypothesisId: "I",
-  };
-  console.log(JSON.stringify(logDataLb));
-  // #endregion
-
   // Get sorted score index (much faster than reading all users)
   const indexRef = rtdb.ref("indexes/sortedScores");
 
@@ -649,51 +498,12 @@ async function updateLeaderboardIncremental(affectedUids) {
   }
 
   const sortedIndex = indexSnap.val() || [];
-  // #region agent log
-  const logDataLb2 = {
-    location: "functions/index.js:602",
-    message: "updateLeaderboardIncremental: Index read",
-    data: {
-      indexSize: sortedIndex.length,
-      affectedInIndex: sortedIndex
-          .filter((e) => affectedUids.includes(e.uid))
-          .length,
-      allUids: sortedIndex.map((e) => e.uid),
-    },
-    timestamp: Date.now(),
-    sessionId: "debug-session",
-    runId: "run1",
-    hypothesisId: "I",
-  };
-  console.log(JSON.stringify(logDataLb2));
-  // #endregion
-
   // Get top 10 (most efficient - only processes first 10 entries)
   // CRITICAL FIX: If there are fewer than 10 users total,
   // show all users (including 0-score users)
   const top10Index = sortedIndex.length < 10 ?
     sortedIndex :
     sortedIndex.slice(0, 10);
-
-  // #region agent log
-  const logDataLb3 = {
-    location: "functions/index.js:610",
-    message: "updateLeaderboardIncremental: Top 10 extracted",
-    data: {
-      top10Count: top10Index.length,
-      top10Uids: top10Index.map((e) => e.uid),
-      affectedInTop10: top10Index
-          .filter((e) => affectedUids.includes(e.uid))
-          .length,
-    },
-    timestamp: Date.now(),
-    sessionId: "debug-session",
-    runId: "run1",
-    hypothesisId: "I",
-  };
-  console.log(JSON.stringify(logDataLb3));
-  // #endregion
-
   // Get user details for top 10 only (much fewer reads)
   const allUsers = [];
   for (const entry of top10Index) {
@@ -765,23 +575,6 @@ async function updateLeaderboardIncremental(affectedUids) {
     lastUpdated: Date.now(),
     totalUsers: allUsers.length,
   });
-
-  // #region agent log
-  const logDataLb4 = {
-    location: "functions/index.js:705",
-    message: "updateLeaderboardIncremental: Leaderboard updated",
-    data: {
-      top10Uids: allUsers.map((u) => u.uid),
-      top10Scores: allUsers.map((u) => u.score),
-      affectedUids,
-    },
-    timestamp: Date.now(),
-    sessionId: "debug-session",
-    runId: "run1",
-    hypothesisId: "I",
-  };
-  console.log(JSON.stringify(logDataLb4));
-  // #endregion
 }
 
 /**
@@ -984,6 +777,43 @@ exports.refreshAllCaches = onCall(
         };
       } catch (error) {
         throw new HttpsError("internal", "Failed to refresh caches");
+      }
+    },
+);
+
+/**
+ * Manual trigger to process a specific batch (for testing/debugging)
+ */
+exports.processBatchManually = onCall(
+    {region: region},
+    async (request) => {
+      // Check if user is admin
+      if (!request.auth) {
+        throw new HttpsError("unauthenticated", "User must be authenticated");
+      }
+
+      const adminDoc = await db.collection("admins")
+          .doc(request.auth.uid).get();
+      if (!adminDoc.exists) {
+        throw new HttpsError(
+            "permission-denied",
+            "Only admins can manually process batches",
+        );
+      }
+
+      try {
+        const batchId = request.data.batchId || getCurrentBatchId();
+        const result = await processBatchIdempotent(batchId);
+        return {
+          success: true,
+          batchId,
+          result,
+        };
+      } catch (error) {
+        throw new HttpsError(
+            "internal",
+            "Failed to process batch: " + error.message,
+        );
       }
     },
 );
@@ -1412,53 +1242,26 @@ exports.onUserCreated = onValueCreated(
         // Add user to active cache
         await updateAdminCacheIncremental(uid, "active", updatedUserData);
 
-        // #region agent log
-        const logData7 = {
-          location: "functions/index.js:1206",
-          message: "onUserCreated: Before index updates",
-          data: {uid, score: userData.score || 0},
-          timestamp: Date.now(),
-          sessionId: "debug-session",
-          runId: "run1",
-          hypothesisId: "I",
-        };
-        console.log(JSON.stringify(logData7));
-        // #endregion
+        // CRITICAL: Remove user from pending cache if they exist there
+        // Prevents duplicates when user migrates from pendingUsers to users
+        // Find the encoded email from the user's email
+        if (userData.email) {
+          const normalizedEmail = userData.email.toLowerCase().trim();
+          // Encode email the same way as in client code
+          const base64 = Buffer.from(normalizedEmail).toString("base64");
+          const encodedEmail = base64.replace(/[/+=]/g, (m) => {
+            const map = {"/": "_", "+": "-", "=": ""};
+            return map[m] || "";
+          });
 
-        // Update sorted score index
-        await updateSortedScoreIndex([uid]);
-
-        // #region agent log
-        const logData8 = {
-          location: "functions/index.js:1210",
-          message: "onUserCreated: After updateSortedScoreIndex",
-          data: {uid},
-          timestamp: Date.now(),
-          sessionId: "debug-session",
-          runId: "run1",
-          hypothesisId: "I",
-        };
-        console.log(JSON.stringify(logData8));
-        // #endregion
-
-        // Update ranks for this user
+          // Remove from pending cache
+          await removeFromAdminCache(encodedEmail, "pending");
+        } // Update sorted score index
+        await updateSortedScoreIndex([uid]); // Update ranks for this user
         await updateRanksIncremental([uid]);
 
         // Update leaderboard if user is in top 10
         await updateLeaderboardIncremental([uid]);
-
-        // #region agent log
-        const logData9 = {
-          location: "functions/index.js:1214",
-          message: "onUserCreated: After updateLeaderboardIncremental",
-          data: {uid},
-          timestamp: Date.now(),
-          sessionId: "debug-session",
-          runId: "run1",
-          hypothesisId: "I",
-        };
-        console.log(JSON.stringify(logData9));
-        // #endregion
       } catch (error) {
         // Non-critical, don't throw
       }

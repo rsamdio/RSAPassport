@@ -1576,6 +1576,52 @@ async function loadParticipants(forceRefresh = false) {
             }
         }
         
+        // CRITICAL: Deduplicate participants by email
+        // A user should only appear once - if they exist in both pending and active,
+        // prefer the active version (they've logged in)
+        const emailMap = new Map();
+        const duplicateEmails = [];
+        
+        participants.forEach(participant => {
+            const email = participant.email?.toLowerCase().trim();
+            if (!email) {
+                // If no email, use ID as fallback (shouldn't happen, but be safe)
+                const fallbackKey = participant.id || participant.identifier || Math.random().toString();
+                if (!emailMap.has(fallbackKey)) {
+                    emailMap.set(fallbackKey, participant);
+                }
+                return;
+            }
+            
+            const existing = emailMap.get(email);
+            if (!existing) {
+                emailMap.set(email, participant);
+            } else {
+                // Duplicate found - log it
+                duplicateEmails.push(email);
+                
+                // If one is active and one is pending, keep the active one
+                if (participant.type === 'active' && existing.type === 'pending') {
+                    console.log(`Deduplication: Removing pending user, keeping active for email: ${email}`);
+                    emailMap.set(email, participant);
+                } else if (participant.type === 'pending' && existing.type === 'active') {
+                    // Keep the existing active one, ignore this pending
+                    console.log(`Deduplication: Ignoring pending user, keeping active for email: ${email}`);
+                } else {
+                    // Both same type - keep the first one (already in map)
+                    console.log(`Deduplication: Both same type for email: ${email}, keeping first`);
+                }
+            }
+        });
+        
+        // Log if duplicates were found
+        if (duplicateEmails.length > 0) {
+            console.warn(`Found ${duplicateEmails.length} duplicate participants by email:`, duplicateEmails);
+        }
+        
+        // Convert back to array
+        participants = Array.from(emailMap.values());
+        
         // Sort all participants by date (newest first)
         participants.sort((a, b) => b.sortDate - a.sortDate);
         
