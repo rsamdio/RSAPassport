@@ -1172,9 +1172,12 @@ async function loadUserProfile() {
         }
         
         // Validate session before loading profile (fixes zombie token)
-        await validateLocalSession();        // Get user data from RTDB (primary source) - always fetch for freshness
+        await validateLocalSession();
+        // Get user data from RTDB (primary source) - always fetch for freshness
         const userRef = ref(rtdb, `users/${currentUser.uid}`);
-        const userSnap = await get(userRef);        if (exists) {            const userData = userSnap.val();
+        const userSnap = await get(userRef);
+        if (userSnap.exists()) {
+            const userData = userSnap.val();
             
             // Always use RTDB data as source of truth (RTDB is always fresh)
             // RTDB is the authoritative source - only use cache if RTDB data is completely missing
